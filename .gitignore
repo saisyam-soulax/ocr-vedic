@@ -1,0 +1,36 @@
+# Python
+backend/.venv/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# OCR upload batches (configurable UPLOAD_STORAGE_DIR)
+data/uploads/
+backend/data/uploads/
+
+# Env
+.env
+.env.local
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.idea/
+.vscode/
+.venv/
+backend/.venv/
+frontend/.venv/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

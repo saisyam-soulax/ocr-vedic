@@ -1,0 +1,1 @@
+"""Vedic OCR FastAPI application."""
