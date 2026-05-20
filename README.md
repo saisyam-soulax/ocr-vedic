@@ -4,9 +4,9 @@ Production-oriented **multimodal OCR** for Vedic and Sanskrit sources: **Devanā
 
 ## Features
 
-- **Providers**: `gemini`, `bedrock_claude` (Converse API), `bedrock_ocr` (Converse-compatible vision model such as Llama 3.2 Vision or Amazon Nova—verify in your region).
+- **Providers**: `gemini`, `bedrock_claude` (Converse API), `bedrock_ocr` (Converse-compatible vision model such as Llama 3.2 Vision or Amazon Nova—verify in your region), `vllm_gemma` (local **Gemma 4 31B** via [vLLM](https://docs.vllm.ai/projects/recipes/en/latest/Google/Gemma4.html) on NVIDIA GPU).
 - **Model selection**: The UI reads `GET /api/providers` for each provider's default model id and optional comma-separated env allowlists; OCR accepts optional `model_id` to override the server default without redeploy.
-- **Few-shot steering**: ordered example images + gold text sent before each page (Gemini and Bedrock).
+- **Few-shot steering**: ordered example images + gold text sent before each page (Gemini, Bedrock, and vLLM).
 - **PDFs**: rasterized server-side with **PyMuPDF** (per-page OCR, JSON + combined export).
 - **API**: `POST /api/ocr`, `GET /api/providers`, `GET /health`, CORS-ready for local dev.
 
@@ -48,16 +48,38 @@ npm run dev
 
 Open `http://localhost:5173`. The Vite dev server **proxies** `/api` and `/health` to `http://127.0.0.1:8000` (override with `VITE_API_PROXY_TARGET`).
 
-### Docker Compose (optional)
+### Docker Compose (LAN / production UI)
 
 From the repo root (after copying `.env.example` → `.env` and filling values):
 
 ```bash
-docker compose up --build
+docker compose up -d --build
 ```
 
-- API: `http://localhost:8000`
-- UI: `http://localhost:5173` (dev server; proxy targets `http://backend:8000` inside Compose)
+- UI + API (single origin): `http://<this-machine-LAN-IP>/` (nginx on port **80** proxies `/api` and `/health` to the backend)
+- Set `CORS_ORIGINS` in `.env` to include your LAN IP if browsers call the API from another origin
+
+One-time host setup (firewall + start on boot):
+
+```bash
+./deploy/setup-host.sh
+```
+
+For local frontend dev only (port 5173), run `npm run dev` in `frontend/` with the backend on port 8000.
+
+### Local GPU (vLLM + Gemma 4)
+
+On a machine with an NVIDIA GPU (e.g. Blackwell / GB10), run the vLLM sidecar with the production stack:
+
+```bash
+# In .env set VLLM_ENABLED=true (see .env.example)
+docker compose --profile vllm up -d --build
+```
+
+- First start downloads **nvidia/Gemma-4-31B-IT-NVFP4** (~32GB) into `~/.cache/huggingface`; vLLM health may take **10+ minutes**.
+- The UI shows **Local — Gemma 4 (vLLM)** when `GET /api/providers` reports `vllm_gemma` as configured.
+- vLLM uses the GPU; cloud providers (Gemini/Bedrock) still work over the network from the same backend.
+- LAN URL unchanged: `http://<this-machine-LAN-IP>/`
 
 ## Environment variables
 
@@ -75,6 +97,12 @@ docker compose up --build
 | `BEDROCK_CLAUDE_MODEL_OPTIONS` | Optional comma-separated allowlist surfaced in `/api/providers` |
 | `BEDROCK_OCR_MODEL_ID` | Multimodal non-Claude model id (must support **Converse** with images) |
 | `BEDROCK_OCR_MODEL_OPTIONS` | Optional comma-separated allowlist for `bedrock_ocr` |
+| `VLLM_ENABLED` | `true` to enable local Gemma 4 OCR via vLLM |
+| `VLLM_BASE_URL` | OpenAI-compatible API base (Compose: `http://vllm:8000/v1`) |
+| `VLLM_MODEL` | Model id served by vLLM (default `nvidia/Gemma-4-31B-IT-NVFP4`) |
+| `VLLM_MODEL_OPTIONS` | Optional comma-separated allowlist for `vllm_gemma` |
+| `VLLM_REQUEST_TIMEOUT_SECONDS` | HTTP timeout for local inference (default `600`) |
+| `HF_TOKEN` | Optional Hugging Face token for model download in the vLLM container |
 | `OCR_REQUEST_TIMEOUT_SECONDS` | Provider HTTP/read timeout (default `120`) |
 | `CORS_ORIGINS` | Comma-separated browser origins |
 | `UPLOAD_STORAGE_DIR` | OCR batches as `<dir>/<uuid>/` + `metadata.json`. Default: `<backend-root>/data/uploads` (gitignored) |
@@ -110,7 +138,7 @@ JSON list of `{ id, label, configured, default_model_id?, model_options[] }` des
 | Field | Description |
 |-------|-------------|
 | `files` | One or more PDFs and/or images (PNG, JPEG, WebP, GIF) |
-| `provider` | `gemini` \| `bedrock_claude` \| `bedrock_ocr` |
+| `provider` | `gemini` \| `bedrock_claude` \| `bedrock_ocr` \| `vllm_gemma` |
 | `model_id` | Optional non-empty override for the multimodal model id (otherwise each provider uses its configured default env) |
 | `system_prompt` | Optional; strong default is applied if omitted |
 | `few_shots` | JSON array: `[{"expected_text":"..." , "image_base64?":"..." , "mime_type?":"..."}]` |

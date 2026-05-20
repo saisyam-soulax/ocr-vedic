@@ -91,6 +91,34 @@ class Settings(BaseSettings):
     )
 
     ocr_request_timeout_seconds: int = 120
+
+    vllm_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("VLLM_ENABLED", "vllm_enabled"),
+    )
+    vllm_base_url: str = Field(
+        default="http://vllm:8000/v1",
+        validation_alias=AliasChoices("VLLM_BASE_URL", "vllm_base_url"),
+    )
+    vllm_model: str = Field(
+        default="nvidia/Gemma-4-31B-IT-NVFP4",
+        validation_alias=AliasChoices("VLLM_MODEL", "vllm_model"),
+    )
+    vllm_model_options: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("VLLM_MODEL_OPTIONS", "vllm_model_options"),
+    )
+    vllm_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("VLLM_API_KEY", "vllm_api_key"),
+    )
+    vllm_request_timeout_seconds: int = Field(
+        default=600,
+        validation_alias=AliasChoices(
+            "VLLM_REQUEST_TIMEOUT_SECONDS",
+            "vllm_request_timeout_seconds",
+        ),
+    )
     cors_origins: str = Field(
         default="http://localhost:5173,http://127.0.0.1:5173",
         validation_alias=AliasChoices("CORS_ORIGINS", "cors_origins"),
@@ -129,6 +157,13 @@ class Settings(BaseSettings):
         d = self.bedrock_ocr_model_id
         opts = _dedupe_order(_comma_separated_nonempty(self.bedrock_ocr_model_options) + ([d] if d else []))
         return d, opts
+
+    def vllm_models_for_providers(self) -> tuple[str | None, list[str]]:
+        default = self.vllm_model
+        opts = _dedupe_order(
+            _comma_separated_nonempty(self.vllm_model_options) + [default]
+        )
+        return default, opts
 
 
 @lru_cache

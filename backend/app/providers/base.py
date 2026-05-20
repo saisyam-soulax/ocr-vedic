@@ -56,6 +56,7 @@ def transcribe_with_provider(
     from app.providers.bedrock_claude import BedrockClaudeProvider
     from app.providers.bedrock_open import BedrockOpenMultimodalProvider
     from app.providers.gemini import GeminiProvider
+    from app.providers.vllm_gemma import VllmGemmaProvider
     from app.schemas import OcrProvider
 
     parsed = OcrProvider(provider_name)
@@ -67,7 +68,10 @@ def transcribe_with_provider(
         )
         for x in few_shots
     ]
-    timeout = settings.ocr_request_timeout_seconds
+    if parsed == OcrProvider.vllm_gemma:
+        timeout = settings.vllm_request_timeout_seconds
+    else:
+        timeout = settings.ocr_request_timeout_seconds
 
     if parsed == OcrProvider.gemini:
         impl: OcrProviderBase = GeminiProvider(
@@ -79,11 +83,18 @@ def transcribe_with_provider(
             settings=settings, timeout_seconds=timeout, model_id=model_id
         )
         effective_model = model_id or settings.bedrock_claude_model_id
-    else:
+    elif parsed == OcrProvider.bedrock_ocr:
         impl = BedrockOpenMultimodalProvider(
             settings=settings, timeout_seconds=timeout, model_id=model_id
         )
         effective_model = model_id or settings.bedrock_ocr_model_id
+    elif parsed == OcrProvider.vllm_gemma:
+        impl = VllmGemmaProvider(
+            settings=settings, timeout_seconds=timeout, model_id=model_id
+        )
+        effective_model = model_id or settings.vllm_model
+    else:
+        raise ValueError(f"Unsupported provider: {provider_name}")
 
     logger.debug(
         "Dispatching transcribe: provider=%s model=%s image_size=%d bytes few_shots=%d",

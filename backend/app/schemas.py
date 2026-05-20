@@ -8,6 +8,7 @@ class OcrProvider(str, Enum):
     gemini = "gemini"
     bedrock_claude = "bedrock_claude"
     bedrock_ocr = "bedrock_ocr"
+    vllm_gemma = "vllm_gemma"
 
 
 class FewShotExample(BaseModel):

@@ -84,8 +84,21 @@ def _provider_configured(settings: Settings, p: OcrProvider) -> tuple[bool, str 
     if p == OcrProvider.bedrock_claude:
         ok = bool(settings.aws_region and settings.bedrock_claude_model_id)
         return ok, None if ok else "Set AWS_REGION and BEDROCK_CLAUDE_MODEL_ID"
-    ok = bool(settings.aws_region and settings.bedrock_ocr_model_id)
-    return ok, None if ok else "Set AWS_REGION and BEDROCK_OCR_MODEL_ID"
+    if p == OcrProvider.bedrock_ocr:
+        ok = bool(settings.aws_region and settings.bedrock_ocr_model_id)
+        return ok, None if ok else "Set AWS_REGION and BEDROCK_OCR_MODEL_ID"
+    if not settings.vllm_enabled:
+        return False, "Set VLLM_ENABLED=true and start vLLM (docker compose --profile vllm)"
+    if not settings.vllm_base_url:
+        return False, "Set VLLM_BASE_URL"
+    from app.providers.vllm_gemma import check_vllm_reachable
+
+    if not check_vllm_reachable(settings):
+        return (
+            False,
+            "vLLM server not reachable — run: docker compose --profile vllm up -d",
+        )
+    return True, None
 
 
 @asynccontextmanager
@@ -130,6 +143,7 @@ def create_app() -> FastAPI:
             OcrProvider.gemini: "Google Gemini",
             OcrProvider.bedrock_claude: "AWS Bedrock — Claude",
             OcrProvider.bedrock_ocr: "AWS Bedrock — Open multimodal",
+            OcrProvider.vllm_gemma: "Local — Gemma 4 (vLLM)",
         }
         for p in OcrProvider:
             configured, detail = _provider_configured(s, p)
@@ -139,8 +153,10 @@ def create_app() -> FastAPI:
                 default_mid, mids = s.gemini_models_for_providers()
             elif p == OcrProvider.bedrock_claude:
                 default_mid, mids = s.bedrock_claude_models_for_providers()
-            else:
+            elif p == OcrProvider.bedrock_ocr:
                 default_mid, mids = s.bedrock_open_models_for_providers()
+            else:
+                default_mid, mids = s.vllm_models_for_providers()
             rows.append(
                 ProviderInfo(
                     id=p.value,
@@ -156,7 +172,9 @@ def create_app() -> FastAPI:
     @app.post("/api/ocr", response_model=OcrResponse)
     async def ocr(
         files: Annotated[list[UploadFile], File(description="PDF and/or image files")],
-        provider: str = Form(..., description="gemini | bedrock_claude | bedrock_ocr"),
+        provider: str = Form(
+            ..., description="gemini | bedrock_claude | bedrock_ocr | vllm_gemma"
+        ),
         system_prompt: str | None = Form(None),
         few_shots: str | None = Form(
             None,
@@ -212,7 +230,10 @@ def create_app() -> FastAPI:
             logger.warning("Invalid provider value: %r", provider)
             raise HTTPException(
                 status_code=422,
-                detail=f"Invalid provider '{provider}'. Use one of: gemini, bedrock_claude, bedrock_ocr.",
+                detail=(
+                    f"Invalid provider '{provider}'. Use one of: "
+                    "gemini, bedrock_claude, bedrock_ocr, vllm_gemma."
+                ),
             ) from exc
 
         ok, msg = _provider_configured(s, prov)

@@ -376,6 +376,7 @@ export default function App() {
                     <option value="gemini">Google Gemini</option>
                     <option value="bedrock_claude">AWS Bedrock — Claude</option>
                     <option value="bedrock_ocr">AWS Bedrock — Open multimodal</option>
+                    <option value="vllm_gemma">Local — Gemma 4 (vLLM)</option>
                   </>
                 )}
               </select>
