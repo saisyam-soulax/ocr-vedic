@@ -613,3 +613,85 @@ select {
   object-fit: contain;
   background: var(--surface);
 }
+
+/* ---- vLLM status panel ---- */
+.vllm-panel {
+  margin-top: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+}
+
+.vllm-panel__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.vllm-panel__state {
+  font-weight: 600;
+  font-size: 0.88rem;
+}
+
+.vllm-panel__msg {
+  font-size: 0.80rem;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 28ch;
+}
+
+/* ---- Status dot ---- */
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--border-strong);
+}
+
+.status-dot--ready    { background: var(--success); }
+.status-dot--error    { background: var(--danger); }
+.status-dot--stopped  { background: var(--border-strong); }
+
+.status-dot--starting,
+.status-dot--stopping {
+  background: #f59e0b;
+  animation: status-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.35; }
+}
+
+/* ---- Progress strip ---- */
+.progress-strip {
+  margin-top: var(--space-md);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.progress-strip__label {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+}
+
+.progress-strip__bar {
+  height: 6px;
+  background: var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.progress-strip__fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.4s ease;
+  min-width: 4px;
+}

@@ -1,11 +1,13 @@
+from __future__ import annotations
+
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 def _default_upload_storage_dir() -> str:
-    """Default upload root; resolved at Settings init (avoids class-body NameError on partial saves)."""
     backend_root = Path(__file__).resolve().parents[1]
     return str((backend_root / "data" / "uploads").resolve())
 
@@ -41,6 +43,7 @@ class Settings(BaseSettings):
         populate_by_name=True,
     )
 
+    # Google Gemini
     google_api_key: str | None = None
     gemini_model: str = Field(
         default="gemini-2.0-flash",
@@ -50,16 +53,10 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("GEMINI_MODEL_OPTIONS", "gemini_model_options"),
     )
-    #: Route Gemini calls through Vertex AI (required for Agentic Platform keys / `AQ.*`
-    #: tokens and for Vertex-only models like `gemini-3.1-pro`). Accepts either the
-    #: project-local `GEMINI_USE_VERTEXAI` env var or the SDK-native
-    #: `GOOGLE_GENAI_USE_VERTEXAI`.
     gemini_use_vertexai: bool = Field(
         default=False,
         validation_alias=AliasChoices(
-            "GEMINI_USE_VERTEXAI",
-            "GOOGLE_GENAI_USE_VERTEXAI",
-            "gemini_use_vertexai",
+            "GEMINI_USE_VERTEXAI", "GOOGLE_GENAI_USE_VERTEXAI", "gemini_use_vertexai"
         ),
     )
     google_cloud_project: str | None = Field(
@@ -71,27 +68,41 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("GOOGLE_CLOUD_LOCATION", "google_cloud_location"),
     )
 
+    # AWS Bedrock
     aws_region: str | None = None
     aws_profile: str | None = None
     bedrock_claude_model_id: str | None = None
     bedrock_claude_model_options: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
-            "BEDROCK_CLAUDE_MODEL_OPTIONS",
-            "bedrock_claude_model_options",
+            "BEDROCK_CLAUDE_MODEL_OPTIONS", "bedrock_claude_model_options"
         ),
     )
     bedrock_ocr_model_id: str | None = None
     bedrock_ocr_model_options: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
-            "BEDROCK_OCR_MODEL_OPTIONS",
-            "bedrock_ocr_model_options",
+            "BEDROCK_OCR_MODEL_OPTIONS", "bedrock_ocr_model_options"
         ),
     )
 
+    # OCR performance
     ocr_request_timeout_seconds: int = 120
+    ocr_page_concurrency: int = Field(
+        default=8,
+        validation_alias=AliasChoices("OCR_PAGE_CONCURRENCY", "ocr_page_concurrency"),
+    )
+    ocr_pdf_dpi: int = Field(
+        default=150,
+        validation_alias=AliasChoices("OCR_PDF_DPI", "ocr_pdf_dpi"),
+    )
+    # How many times to retry a failed page before giving up (0 = no retries).
+    ocr_page_max_retries: int = Field(
+        default=2,
+        validation_alias=AliasChoices("OCR_PAGE_MAX_RETRIES", "ocr_page_max_retries"),
+    )
 
+    # Local vLLM
     vllm_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("VLLM_ENABLED", "vllm_enabled"),
@@ -115,26 +126,38 @@ class Settings(BaseSettings):
     vllm_request_timeout_seconds: int = Field(
         default=600,
         validation_alias=AliasChoices(
-            "VLLM_REQUEST_TIMEOUT_SECONDS",
-            "vllm_request_timeout_seconds",
+            "VLLM_REQUEST_TIMEOUT_SECONDS", "vllm_request_timeout_seconds"
         ),
     )
+    # Set true to let the backend start/stop vLLM via the Docker socket.
+    vllm_on_demand: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("VLLM_ON_DEMAND", "vllm_on_demand"),
+    )
+    # Docker container name for the vLLM service (docker compose naming: <project>_<service>_1).
+    vllm_container_name: str = Field(
+        default="ocr-vedic-vllm-1",
+        validation_alias=AliasChoices("VLLM_CONTAINER_NAME", "vllm_container_name"),
+    )
+    # Send a tiny warm-up request after load so first real page is fast.
+    vllm_warmup_on_load: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("VLLM_WARMUP_ON_LOAD", "vllm_warmup_on_load"),
+    )
+
     cors_origins: str = Field(
         default="http://localhost:5173,http://127.0.0.1:5173",
         validation_alias=AliasChoices("CORS_ORIGINS", "cors_origins"),
     )
 
-    #: Root directory for OCR upload batches (`<dir>/<uuid>/...`). Defaults to ``<backend-root>/data/uploads``.
     upload_storage_dir: str = Field(
         default_factory=_default_upload_storage_dir,
         validation_alias=AliasChoices("UPLOAD_STORAGE_DIR", "upload_storage_dir"),
     )
-    #: When false, successfully processed batches under ``upload_storage_dir`` are removed.
     upload_retain: bool = Field(
         default=False,
         validation_alias=AliasChoices("UPLOAD_RETAIN", "upload_retain"),
     )
-    #: Prune stale batch folders older than this many hours when > 0 (by directory mtime).
     upload_retain_hours: float = Field(
         default=168.0,
         validation_alias=AliasChoices("UPLOAD_RETAIN_HOURS", "upload_retain_hours"),
@@ -145,17 +168,25 @@ class Settings(BaseSettings):
 
     def gemini_models_for_providers(self) -> tuple[str | None, list[str]]:
         default = self.gemini_model
-        opts = _dedupe_order(_comma_separated_nonempty(self.gemini_model_options) + [default])
+        opts = _dedupe_order(
+            _comma_separated_nonempty(self.gemini_model_options) + [default]
+        )
         return default, opts
 
     def bedrock_claude_models_for_providers(self) -> tuple[str | None, list[str]]:
         d = self.bedrock_claude_model_id
-        opts = _dedupe_order(_comma_separated_nonempty(self.bedrock_claude_model_options) + ([d] if d else []))
+        opts = _dedupe_order(
+            _comma_separated_nonempty(self.bedrock_claude_model_options)
+            + ([d] if d else [])
+        )
         return d, opts
 
     def bedrock_open_models_for_providers(self) -> tuple[str | None, list[str]]:
         d = self.bedrock_ocr_model_id
-        opts = _dedupe_order(_comma_separated_nonempty(self.bedrock_ocr_model_options) + ([d] if d else []))
+        opts = _dedupe_order(
+            _comma_separated_nonempty(self.bedrock_ocr_model_options)
+            + ([d] if d else [])
+        )
         return d, opts
 
     def vllm_models_for_providers(self) -> tuple[str | None, list[str]]:

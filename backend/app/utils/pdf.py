@@ -14,8 +14,8 @@ class PdfPageImage:
     image_bytes: bytes
 
 
-def pdf_bytes_to_page_images(pdf_bytes: bytes, dpi: int = 200) -> list[PdfPageImage]:
-    """Rasterize PDF pages to PNG bytes using PyMuPDF."""
+def pdf_bytes_to_page_images(pdf_bytes: bytes, dpi: int = 150) -> list[PdfPageImage]:
+    """Rasterize all PDF pages to JPEG bytes using PyMuPDF."""
     import fitz  # PyMuPDF
 
     pdf_size = len(pdf_bytes)
@@ -38,30 +38,31 @@ def pdf_bytes_to_page_images(pdf_bytes: bytes, dpi: int = 200) -> list[PdfPageIm
             try:
                 page = doc.load_page(i)
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
-                png = pix.tobytes("png")
+                # Quality 95 preserves fine Devanāgarī strokes; still ~2× smaller than PNG.
+                jpg = pix.tobytes("jpeg", jpg_quality=95)
             except Exception:
                 logger.exception("Failed to rasterize page %d of %d", i + 1, page_count)
                 raise
             logger.debug(
-                "Rasterized page %d/%d: output_size=%d bytes (%dx%d px)",
-                i + 1, page_count, len(png), pix.width, pix.height,
+                "Rasterized page %d/%d: %d bytes (%dx%d px)",
+                i + 1, page_count, len(jpg), pix.width, pix.height,
             )
             out.append(
                 PdfPageImage(
                     page_number=i + 1,
-                    mime_type="image/png",
-                    image_bytes=png,
+                    mime_type="image/jpeg",
+                    image_bytes=jpg,
                 )
             )
     finally:
         doc.close()
 
     logger.info(
-        "PDF rasterization complete: pages=%d total_image_bytes=%d",
+        "PDF rasterization complete: pages=%d total_bytes=%d",
         len(out), sum(len(p.image_bytes) for p in out),
     )
     return out
 
 
-def iter_pdf_pages(pdf_bytes: bytes, dpi: int = 200) -> Iterator[PdfPageImage]:
+def iter_pdf_pages(pdf_bytes: bytes, dpi: int = 150) -> Iterator[PdfPageImage]:
     return iter(pdf_bytes_to_page_images(pdf_bytes, dpi=dpi))

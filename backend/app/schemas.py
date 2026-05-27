@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from enum import Enum
 from typing import Any
 
@@ -11,10 +13,18 @@ class OcrProvider(str, Enum):
     vllm_gemma = "vllm_gemma"
 
 
+class VllmState(str, Enum):
+    stopped = "stopped"
+    starting = "starting"
+    ready = "ready"
+    stopping = "stopping"
+    error = "error"
+
+
 class FewShotExample(BaseModel):
-    image_base64: str = Field(..., description="Base64-encoded image bytes (no data URL prefix).")
+    image_base64: str = Field(..., description="Base64-encoded image bytes.")
     expected_text: str = Field(..., description="Gold transcription for the few-shot image.")
-    mime_type: str = Field(default="image/png", description="MIME type of the few-shot image.")
+    mime_type: str = Field(default="image/png")
 
 
 class OcrPageResult(BaseModel):
@@ -31,6 +41,36 @@ class OcrResponse(BaseModel):
     combined_text: str
 
 
+class OcrJobResponse(BaseModel):
+    job_id: str
+    stream_url: str
+    total_files: int
+
+
+class OcrSavedResult(BaseModel):
+    job_id: str
+    done: bool
+    total: int
+    done_count: int
+    provider: str | None = None
+    files: list[str] = Field(default_factory=list)
+    submitted_at: str | None = None
+    completed_at: str | None = None
+    elapsed_seconds: float | None = None
+    pages: list[OcrPageResult] = Field(default_factory=list)
+
+
+class RecentJobSummary(BaseModel):
+    job_id: str
+    provider: str | None = None
+    files: list[str] = Field(default_factory=list)
+    submitted_at: str | None = None
+    done: bool = False
+    total: int = 0
+    done_count: int = 0
+    completed_at: str | None = None
+
+
 class ProviderInfo(BaseModel):
     id: str
     label: str
@@ -42,6 +82,16 @@ class ProviderInfo(BaseModel):
 
 class ProvidersResponse(BaseModel):
     providers: list[ProviderInfo]
+
+
+class OcrDefaultsResponse(BaseModel):
+    system_prompt: str
+
+
+class VllmStatusResponse(BaseModel):
+    state: VllmState
+    reachable: bool
+    message: str | None = None
 
 
 class HealthResponse(BaseModel):

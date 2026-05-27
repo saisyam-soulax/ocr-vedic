@@ -8,6 +8,12 @@ services:
     expose:
       - "8000"
     restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /usr/bin/docker:/usr/bin/docker:ro
+      - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
+      # Persist OCR results on the host so they survive container restarts/removal.
+      - ./backend/data/uploads:/app/data/uploads
 
   web:
     build:
@@ -44,18 +50,25 @@ services:
       - "8000"
       - --max-model-len
       - "16384"
+      # Allow a full batch of 8 concurrent pages (8 × ~560 image tokens + text headroom)
       - --max-num-batched-tokens
-      - "8192"
+      - "16384"
       - --gpu-memory-utilization
       - "0.90"
       - --limit-mm-per-prompt
       - '{"image": 8, "audio": 0}'
       - --mm-processor-kwargs
       - '{"max_soft_tokens": 560}'
+      # Cache the system-prompt KV across all pages — biggest throughput win
+      - --enable-prefix-caching
+      # Better GPU utilisation for mixed image+text batch sizes
+      - --enable-chunked-prefill
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 10
       start_period: 600s
-    restart: unless-stopped
+    # "no" so the backend (VLLM_ON_DEMAND) owns start/stop; docker stop won't
+    # be countered by an auto-restart from the daemon.
+    restart: "no"

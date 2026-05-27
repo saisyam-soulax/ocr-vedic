@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import functools
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -8,7 +10,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from app.config import Settings
-    from app.schemas import OcrProvider
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,17 @@ class OcrProviderBase(ABC):
         return base64.b64decode(raw, validate=False)
 
 
+def _build_pairs(few_shots: list[dict[str, str]]) -> list[FewShotPair]:
+    return [
+        FewShotPair(
+            image_bytes=OcrProviderBase._decode_b64(x["image_base64"]),
+            mime_type=x.get("mime_type", "image/png"),
+            expected_text=x["expected_text"],
+        )
+        for x in few_shots
+    ]
+
+
 def transcribe_with_provider(
     provider_name: str,
     *,
@@ -52,7 +64,7 @@ def transcribe_with_provider(
     settings: Settings,
     model_id: str | None = None,
 ) -> str:
-    """Dispatch to the correct provider implementation."""
+    """Synchronous dispatch — used directly or via run_in_executor."""
     from app.providers.bedrock_claude import BedrockClaudeProvider
     from app.providers.bedrock_open import BedrockOpenMultimodalProvider
     from app.providers.gemini import GeminiProvider
@@ -60,46 +72,24 @@ def transcribe_with_provider(
     from app.schemas import OcrProvider
 
     parsed = OcrProvider(provider_name)
-    pairs = [
-        FewShotPair(
-            image_bytes=OcrProviderBase._decode_b64(x["image_base64"]),
-            mime_type=x.get("mime_type", "image/png"),
-            expected_text=x["expected_text"],
-        )
-        for x in few_shots
-    ]
-    if parsed == OcrProvider.vllm_gemma:
-        timeout = settings.vllm_request_timeout_seconds
-    else:
-        timeout = settings.ocr_request_timeout_seconds
+    pairs = _build_pairs(few_shots)
+
+    timeout = (
+        settings.vllm_request_timeout_seconds
+        if parsed == OcrProvider.vllm_gemma
+        else settings.ocr_request_timeout_seconds
+    )
 
     if parsed == OcrProvider.gemini:
-        impl: OcrProviderBase = GeminiProvider(
-            settings=settings, timeout_seconds=timeout, model_id=model_id
-        )
-        effective_model = model_id or settings.gemini_model
+        impl: OcrProviderBase = GeminiProvider(settings=settings, timeout_seconds=timeout, model_id=model_id)
     elif parsed == OcrProvider.bedrock_claude:
-        impl = BedrockClaudeProvider(
-            settings=settings, timeout_seconds=timeout, model_id=model_id
-        )
-        effective_model = model_id or settings.bedrock_claude_model_id
+        impl = BedrockClaudeProvider(settings=settings, timeout_seconds=timeout, model_id=model_id)
     elif parsed == OcrProvider.bedrock_ocr:
-        impl = BedrockOpenMultimodalProvider(
-            settings=settings, timeout_seconds=timeout, model_id=model_id
-        )
-        effective_model = model_id or settings.bedrock_ocr_model_id
+        impl = BedrockOpenMultimodalProvider(settings=settings, timeout_seconds=timeout, model_id=model_id)
     elif parsed == OcrProvider.vllm_gemma:
-        impl = VllmGemmaProvider(
-            settings=settings, timeout_seconds=timeout, model_id=model_id
-        )
-        effective_model = model_id or settings.vllm_model
+        impl = VllmGemmaProvider(settings=settings, timeout_seconds=timeout, model_id=model_id)
     else:
         raise ValueError(f"Unsupported provider: {provider_name}")
-
-    logger.debug(
-        "Dispatching transcribe: provider=%s model=%s image_size=%d bytes few_shots=%d",
-        provider_name, effective_model, len(image_bytes), len(pairs),
-    )
 
     return impl.transcribe(
         image_bytes=image_bytes,
@@ -107,6 +97,57 @@ def transcribe_with_provider(
         system_prompt=system_prompt,
         few_shots=pairs,
     )
+
+
+async def transcribe_with_provider_async(
+    provider_name: str,
+    *,
+    image_bytes: bytes,
+    mime_type: str,
+    system_prompt: str,
+    few_shots: list[dict[str, str]],
+    settings: Settings,
+    model_id: str | None = None,
+) -> str:
+    """Async dispatch.
+
+    vLLM uses a native AsyncClient for true concurrency.
+    All other providers run their sync implementation in the default thread pool
+    so they don't block the event loop.
+    """
+    from app.schemas import OcrProvider
+
+    parsed = OcrProvider(provider_name)
+
+    if parsed == OcrProvider.vllm_gemma:
+        from app.providers.vllm_gemma import VllmGemmaProvider
+
+        pairs = _build_pairs(few_shots)
+        impl = VllmGemmaProvider(
+            settings=settings,
+            timeout_seconds=settings.vllm_request_timeout_seconds,
+            model_id=model_id,
+        )
+        return await impl.async_transcribe(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            system_prompt=system_prompt,
+            few_shots=pairs,
+        )
+
+    # All other providers: run sync in thread pool.
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(
+        transcribe_with_provider,
+        provider_name,
+        image_bytes=image_bytes,
+        mime_type=mime_type,
+        system_prompt=system_prompt,
+        few_shots=few_shots,
+        settings=settings,
+        model_id=model_id,
+    )
+    return await loop.run_in_executor(None, fn)
 
 
 def transcribe_image(
@@ -119,7 +160,6 @@ def transcribe_image(
     settings: Settings | None = None,
     model_id: str | None = None,
 ) -> str:
-    """Unified OCR entrypoint: transcribe a single image with optional few-shots."""
     from app.config import get_settings
 
     return transcribe_with_provider(

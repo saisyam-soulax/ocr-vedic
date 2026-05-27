@@ -86,7 +86,7 @@ docker compose --profile vllm up -d --build
 | Variable | Purpose |
 |----------|---------|
 | `GOOGLE_API_KEY` | Gemini API key. AI Studio keys start with `AIzaSy...`; Vertex AI / Agentic Platform keys start with `AQ....` (also set `GEMINI_USE_VERTEXAI=true` for those). |
-| `GEMINI_MODEL` | Vision model id (default `gemini-2.0-flash`). When Google ships newer vision tiers (e.g. `gemini-3-*`), point this env there without code changes. |
+| `GEMINI_MODEL` | Vision model id (default `gemini-3.1-pro-preview`). Override in `.env` when Google ships newer tiers. |
 | `GEMINI_MODEL_OPTIONS` | Optional comma-separated list of Gemini model ids surfaced in `/api/providers` (falls back to `GEMINI_MODEL` alone if unset). |
 | `GEMINI_USE_VERTEXAI` | `true` routes the SDK through Vertex AI (required for Agentic Platform keys and Vertex-only models such as `gemini-3.1-pro`). Also accepts `GOOGLE_GENAI_USE_VERTEXAI`. |
 | `GOOGLE_CLOUD_PROJECT` | GCP project id (numeric or name) used when `GEMINI_USE_VERTEXAI=true`. |
