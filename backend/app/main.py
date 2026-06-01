@@ -75,7 +75,10 @@ from app.services.ocr_service import (
     parse_few_shots_json,
     run_ocr_job,
 )
+from app.utils.model_id import resolve_model_id_for_provider
+from app.utils.output_format import format_consolidated_ocr_text, page_sort_key
 from app.storage_uploads import persist_ocr_uploads, prune_old_batches, write_batch_metadata
+from app.cost.gemini_ledger import read_global_ledger
 
 # ---------------------------------------------------------------------------
 # In-memory job registry  { job_id -> (queue, background_task, created_at) }
@@ -113,7 +116,7 @@ def _provider_configured(settings: Settings, p: OcrProvider) -> tuple[bool, str 
     if p == OcrProvider.bedrock_ocr:
         ok = bool(settings.aws_region and settings.bedrock_ocr_model_id)
         return ok, None if ok else "Set AWS_REGION and BEDROCK_OCR_MODEL_ID"
-    # vllm_gemma — just check config, not live reachability (use /api/vllm/status for that)
+    # vllm_dots — just check config, not live reachability (use /api/vllm/status for that)
     if not settings.vllm_enabled:
         return False, "Set VLLM_ENABLED=true"
     if not settings.vllm_base_url:
@@ -171,7 +174,7 @@ def create_app() -> FastAPI:
             OcrProvider.gemini: "Google Gemini",
             OcrProvider.bedrock_claude: "AWS Bedrock — Claude",
             OcrProvider.bedrock_ocr: "AWS Bedrock — Open multimodal",
-            OcrProvider.vllm_gemma: "Local — Gemma 4 (vLLM)",
+            OcrProvider.vllm_dots: "Local — dots.ocr (vLLM)",
         }
         rows: list[ProviderInfo] = []
         for p in OcrProvider:
@@ -198,7 +201,8 @@ def create_app() -> FastAPI:
 
     @app.get("/api/ocr/defaults", response_model=OcrDefaultsResponse)
     def ocr_defaults() -> OcrDefaultsResponse:
-        return OcrDefaultsResponse(system_prompt=get_default_system_prompt())
+        # Default ĀrṣaDṛṣṭi protocol is applied server-side; not exposed in the UI.
+        return OcrDefaultsResponse(system_prompt="")
 
     # ------------------------------------------------------------------
     # vLLM lifecycle
@@ -262,7 +266,11 @@ def create_app() -> FastAPI:
     async def submit_ocr(
         files: Annotated[list[UploadFile], File(description="PDF and/or image files")],
         provider: str = Form(...),
-        system_prompt: str | None = Form(None),
+        user_prompt: str | None = Form(None),
+        system_prompt: str | None = Form(
+            None,
+            description="Deprecated alias for user_prompt",
+        ),
         few_shots: str | None = Form(None),
         few_shot_files: Annotated[
             list[UploadFile] | None,
@@ -279,12 +287,17 @@ def create_app() -> FastAPI:
         )
 
         # Validate provider
+        if provider == "vllm_gemma":
+            provider = "vllm_dots"
         try:
             prov = OcrProvider(provider)
         except ValueError:
             raise HTTPException(
                 422,
-                detail=f"Invalid provider '{provider}'. Use: gemini, bedrock_claude, bedrock_ocr, vllm_gemma.",
+                detail=(
+                    f"Invalid provider '{provider}'. "
+                    "Use: gemini, bedrock_claude, bedrock_ocr, vllm_dots."
+                ),
             )
         ok, msg = _provider_configured(s, prov)
         if not ok:
@@ -296,6 +309,14 @@ def create_app() -> FastAPI:
             if not stripped:
                 raise HTTPException(422, detail="model_id must be non-empty when supplied")
             model_id_clean = stripped
+
+        model_id_clean = resolve_model_id_for_provider(s, prov, model_id_clean)
+        if model_id_clean != (model_id.strip() if model_id else None):
+            logger.info(
+                "OCR submit: model resolved to %s for provider=%s",
+                model_id_clean or "(default)",
+                provider,
+            )
 
         # Build few-shots
         parsed_shots = parse_few_shots_json(few_shots)
@@ -323,6 +344,8 @@ def create_app() -> FastAPI:
             },
         )
 
+        effective_user_prompt = (user_prompt or system_prompt or "").strip() or None
+
         # Create job queue and start background processing.
         q: asyncio.Queue = asyncio.Queue()
         task = asyncio.create_task(
@@ -330,7 +353,7 @@ def create_app() -> FastAPI:
                 queue=q,
                 saved_files=saved,
                 provider=provider,
-                system_prompt=system_prompt,
+                user_prompt=effective_user_prompt,
                 few_shots=resolved_shots,
                 settings=s,
                 model_id=model_id_clean,
@@ -340,6 +363,17 @@ def create_app() -> FastAPI:
         )
         job_id = batch_id
         _jobs[job_id] = (q, task, time.time())
+
+        def _drop_job_when_done(t: asyncio.Task) -> None:
+            _jobs.pop(job_id, None)
+            if t.cancelled():
+                logger.info("OCR job task cancelled: %s", job_id)
+            elif t.exception():
+                logger.error("OCR job task failed: %s", job_id, exc_info=t.exception())
+            else:
+                logger.info("OCR job task finished: %s", job_id)
+
+        task.add_done_callback(_drop_job_when_done)
 
         return OcrJobResponse(
             job_id=job_id,
@@ -373,9 +407,9 @@ def create_app() -> FastAPI:
                     event_name = item.get("event", "message")
                     yield f"event: {event_name}\ndata: {json.dumps(item)}\n\n"
             finally:
-                _jobs.pop(job_id, None)
-                if task and not task.done():
-                    task.cancel()
+                # Client disconnected — keep the background OCR task running.
+                # Partial/final results remain on disk (GET /api/ocr/{job_id}/result).
+                logger.info("SSE client disconnected for job %s (task still running)", job_id)
 
         return StreamingResponse(
             generate(),
@@ -404,7 +438,7 @@ def create_app() -> FastAPI:
                         pages.append(json.loads(raw))
                     except json.JSONDecodeError:
                         pass
-        pages.sort(key=lambda p: p.get("index", 0))
+        pages.sort(key=page_sort_key)
 
         complete_path = batch_dir / "job_complete.json"
         done = complete_path.exists()
@@ -433,6 +467,21 @@ def create_app() -> FastAPI:
             except (json.JSONDecodeError, OSError):
                 pass
 
+        combined_path = batch_dir / "ocr_output.txt"
+        if combined_path.exists():
+            combined_text = combined_path.read_text(encoding="utf-8")
+        elif pages:
+            combined_text = format_consolidated_ocr_text(
+                pages,
+                source_files=files,
+                provider=provider,
+                submitted_at=submitted_at,
+                completed_at=completed_at,
+                elapsed_seconds=elapsed,
+            )
+        else:
+            combined_text = ""
+
         return OcrSavedResult(
             job_id=job_id,
             done=done,
@@ -444,6 +493,7 @@ def create_app() -> FastAPI:
             completed_at=completed_at,
             elapsed_seconds=elapsed,
             pages=pages,
+            combined_text=combined_text,
         )
 
     @app.get("/api/ocr/jobs", response_model=dict)
@@ -488,13 +538,14 @@ def create_app() -> FastAPI:
         return _read_saved_result(batch_dir, job_id)
 
     def _build_combined_text(saved: OcrSavedResult) -> str:
-        parts = []
-        for p in saved.pages:
-            header = f"## {p.source_file}"
-            if p.page_in_source is not None:
-                header += f" (page {p.page_in_source})"
-            parts.append(f"{header}\n\n{p.text}")
-        return "\n\n---\n\n".join(parts)
+        return format_consolidated_ocr_text(
+            [p.model_dump() for p in saved.pages],
+            source_files=saved.files,
+            provider=saved.provider,
+            submitted_at=saved.submitted_at,
+            completed_at=saved.completed_at,
+            elapsed_seconds=saved.elapsed_seconds,
+        )
 
     @app.get("/api/ocr/{job_id}/download.txt")
     async def download_txt(job_id: str, s: Settings = Depends(get_settings)) -> Response:
@@ -507,7 +558,7 @@ def create_app() -> FastAPI:
         saved = _read_saved_result(batch_dir, job_id)
         if not saved.pages:
             raise HTTPException(404, "No pages have been saved for this job yet")
-        content = _build_combined_text(saved)
+        content = saved.combined_text or _build_combined_text(saved)
         slug = (saved.files[0].rsplit(".", 1)[0] if saved.files else job_id[:8])
         return Response(
             content=content.encode("utf-8"),
@@ -537,16 +588,18 @@ def create_app() -> FastAPI:
         style.font.name = "Noto Serif"
         style.font.size = Pt(11)
 
-        for p in saved.pages:
-            heading = f"{p.source_file}"
-            if p.page_in_source is not None:
-                heading += f" (page {p.page_in_source})"
+        multi_source = len({p.source_file for p in saved.pages}) > 1
+        for p in sorted(saved.pages, key=lambda x: x.index):
+            num = p.page_in_source if p.page_in_source is not None else p.index + 1
+            heading = f"PAGE {num}"
+            if multi_source:
+                heading = f"{heading} — {p.source_file}"
             h = doc.add_heading(heading, level=2)
             h.style.font.name = "Noto Serif"
             for line in p.text.split("\n"):
                 para = doc.add_paragraph(line)
                 para.style.font.name = "Noto Serif"
-            doc.add_paragraph("―" * 40)
+            doc.add_paragraph("▬" * 40)
 
         buf = io.BytesIO()
         doc.save(buf)
@@ -557,6 +610,64 @@ def create_app() -> FastAPI:
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"Content-Disposition": f'attachment; filename="vedic-ocr-{slug}.docx"'},
         )
+
+    # ------------------------------------------------------------------
+    # Administrator — Gemini cost ledger (persistent across sessions)
+    # ------------------------------------------------------------------
+
+    def _require_admin(request: starlette.requests.Request, s: Settings) -> None:
+        if not s.admin_api_key:
+            return
+        if request.headers.get("X-Admin-Key") != s.admin_api_key:
+            raise HTTPException(
+                401,
+                detail="Missing or invalid X-Admin-Key header.",
+            )
+
+    @app.get("/api/admin/gemini-costs")
+    async def list_gemini_costs(
+        request: starlette.requests.Request,
+        limit: int = 100,
+        s: Settings = Depends(get_settings),
+    ) -> dict:
+        """List recent Gemini OCR job cost summaries from the global ledger."""
+        _require_admin(request, s)
+        limit = max(1, min(limit, 500))
+        records = read_global_ledger(s.gemini_cost_ledger_path(), limit=limit)
+        return {
+            "ledger_path": str(s.gemini_cost_ledger_path()),
+            "pricing_source": "https://ai.google.dev/gemini-api/docs/pricing",
+            "jobs": records,
+        }
+
+    @app.get("/api/admin/gemini-costs/{job_id}")
+    async def get_gemini_costs_for_job(
+        job_id: str,
+        request: starlette.requests.Request,
+        s: Settings = Depends(get_settings),
+    ) -> dict:
+        """Per-job cost log: ledger lines + on-disk gemini_cost_log.json if present."""
+        _require_admin(request, s)
+        if not _UUID_RE.match(job_id):
+            raise HTTPException(400, "Invalid job ID format")
+        ledger_records = read_global_ledger(
+            s.gemini_cost_ledger_path(), limit=10_000, job_id=job_id
+        )
+        batch_dir = s.upload_root_path() / job_id
+        job_log = None
+        cost_path = batch_dir / "gemini_cost_log.json"
+        if cost_path.is_file():
+            try:
+                job_log = json.loads(cost_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                job_log = None
+        if not ledger_records and job_log is None:
+            raise HTTPException(404, "No Gemini cost records found for this job.")
+        return {
+            "job_id": job_id,
+            "ledger_records": ledger_records,
+            "job_cost_log": job_log,
+        }
 
     # ------------------------------------------------------------------
     # Error handlers

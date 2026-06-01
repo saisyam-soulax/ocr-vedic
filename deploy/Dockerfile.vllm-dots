@@ -1,0 +1,7 @@
+# dots.ocr via vLLM >= 0.11.0. DGX Spark GB10: VLLM_USE_FLASHINFER_SAMPLER=0 in compose.
+FROM vllm/vllm-openai:v0.11.0
+
+COPY vllm-entrypoint.sh /opt/vllm-entrypoint.sh
+RUN chmod +x /opt/vllm-entrypoint.sh
+
+ENTRYPOINT ["/opt/vllm-entrypoint.sh"]

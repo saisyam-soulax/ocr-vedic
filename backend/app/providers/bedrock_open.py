@@ -9,6 +9,7 @@ from botocore.exceptions import ClientError
 from app.config import Settings
 from app.providers.base import FewShotPair, OcrProviderBase
 from app.providers.bedrock_claude import _image_part, _text_part
+from app.providers.prompts import user_instructions_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ class BedrockOpenMultimodalProvider(OcrProviderBase):
         image_bytes: bytes,
         mime_type: str,
         system_prompt: str,
+        user_prompt: str | None = None,
         few_shots: list[FewShotPair],
     ) -> str:
         logger.info(
@@ -70,12 +72,14 @@ class BedrockOpenMultimodalProvider(OcrProviderBase):
                 {"role": "assistant", "content": [_text_part(shot.expected_text)]}
             )
 
+        prefix = user_instructions_prefix(user_prompt)
         messages.append(
             {
                 "role": "user",
                 "content": [
                     _text_part(
-                        "Transcribe this page. Preserve Devanāgarī, diacritics, and svara notation. "
+                        prefix
+                        + "Transcribe this page. Preserve Devanāgarī, diacritics, and svara notation. "
                         "Plain text only."
                     ),
                     _image_part(image_bytes, mime_type),

@@ -1,3 +1,8 @@
+# Standalone / legacy OCR scripts (not part of the web app)
+ocr_pipeline/
+pdfToGeminiRangeSpecific.py
+run_ocr_pipeline.py
+
 # Python
 backend/.venv/
 **/__pycache__/

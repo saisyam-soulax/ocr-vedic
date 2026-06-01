@@ -25,50 +25,67 @@ services:
     depends_on:
       - backend
 
+  # dots.ocr via vLLM — load/unload from the UI (VLLM_ON_DEMAND=true).
+  # Defaults assume GPU is SHARED with other jobs (low utilization + CPU offload).
+  # For a dedicated GPU, set VLLM_GPU_MEMORY_UTILIZATION=0.45 in .env.
   vllm:
-    image: vllm/vllm-openai:gemma4-0505-cu130
+    build:
+      context: ./deploy
+      dockerfile: Dockerfile.vllm-dots
+    image: ocr-vedic-vllm-dots:latest
     profiles:
       - vllm
     ipc: host
-    shm_size: "16gb"
+    shm_size: "32gb"
     volumes:
       - ${HOME}/.cache/huggingface:/root/.cache/huggingface
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-0}
+      # GB10 / Blackwell (sm_12.x): prebuilt FlashInfer lacks kernels → use PyTorch sampler
+      VLLM_USE_FLASHINFER_SAMPLER: "0"
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              count: 1
               capabilities: [gpu]
     command:
-      - nvidia/Gemma-4-31B-IT-NVFP4
+      - serve
+      - rednote-hilab/dots.ocr
       - --host
       - "0.0.0.0"
       - --port
       - "8000"
-      - --max-model-len
-      - "16384"
-      # Allow a full batch of 8 concurrent pages (8 × ~560 image tokens + text headroom)
-      - --max-num-batched-tokens
-      - "16384"
+      - --trust-remote-code
+      - --tensor-parallel-size
+      - "1"
       - --gpu-memory-utilization
-      - "0.90"
+      - "${VLLM_GPU_MEMORY_UTILIZATION:-auto}"
+      - --cpu-offload-gb
+      - "${VLLM_CPU_OFFLOAD_GB:-16}"
+      - --chat-template-content-format
+      - string
+      - --served-model-name
+      - model
+      - --max-model-len
+      - "${VLLM_MAX_MODEL_LEN:-4096}"
+      - --max-num-batched-tokens
+      - "${VLLM_MAX_NUM_BATCHED_TOKENS:-2048}"
+      - --dtype
+      - bfloat16
       - --limit-mm-per-prompt
-      - '{"image": 8, "audio": 0}'
-      - --mm-processor-kwargs
-      - '{"max_soft_tokens": 560}'
-      # Cache the system-prompt KV across all pages — biggest throughput win
-      - --enable-prefix-caching
-      # Better GPU utilisation for mixed image+text batch sizes
-      - --enable-chunked-prefill
+      - '{"image": 1}'
+      - --enforce-eager
+      # Skip KV memory profiling (fails when other GPU jobs release memory mid-init)
+      - --kv-cache-memory-bytes
+      - "${VLLM_KV_CACHE_MEMORY_BYTES:-536870912}"
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 10
-      start_period: 600s
-    # "no" so the backend (VLLM_ON_DEMAND) owns start/stop; docker stop won't
-    # be countered by an auto-restart from the daemon.
+      start_period: 300s
     restart: "no"

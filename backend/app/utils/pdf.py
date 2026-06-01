@@ -14,6 +14,35 @@ class PdfPageImage:
     image_bytes: bytes
 
 
+def pdf_page_count(pdf_bytes: bytes) -> int:
+    """Return page count without rasterizing (fast; used to emit OCR start early)."""
+    import fitz
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
+
+
+def pdf_page_to_image(pdf_bytes: bytes, page_number: int, dpi: int = 150) -> PdfPageImage:
+    """Rasterize a single 1-based PDF page to JPEG bytes."""
+    import fitz
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        if page_number < 1 or page_number > doc.page_count:
+            raise ValueError(f"page_number {page_number} out of range 1..{doc.page_count}")
+        scale = dpi / 72.0
+        matrix = fitz.Matrix(scale, scale)
+        page = doc.load_page(page_number - 1)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        jpg = pix.tobytes("jpeg", jpg_quality=95)
+        return PdfPageImage(page_number=page_number, mime_type="image/jpeg", image_bytes=jpg)
+    finally:
+        doc.close()
+
+
 def pdf_bytes_to_page_images(pdf_bytes: bytes, dpi: int = 150) -> list[PdfPageImage]:
     """Rasterize all PDF pages to JPEG bytes using PyMuPDF."""
     import fitz  # PyMuPDF

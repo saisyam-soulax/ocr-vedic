@@ -1,14 +1,42 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from google import genai
 from google.genai import types
 
 from app.config import Settings
 from app.providers.base import FewShotPair, OcrProviderBase
+from app.providers.prompts import user_instructions_prefix
+
+if TYPE_CHECKING:
+    from app.cost.gemini_ledger import GeminiCostSession
 
 logger = logging.getLogger(__name__)
+
+
+def _usage_from_response(response: object) -> dict[str, int]:
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cached_tokens": 0,
+            "total_tokens": 0,
+        }
+    prompt = int(getattr(usage, "prompt_token_count", 0) or 0)
+    output = int(getattr(usage, "candidates_token_count", 0) or 0)
+    cached = int(getattr(usage, "cached_content_token_count", 0) or 0)
+    total = getattr(usage, "total_token_count", None)
+    if total is None:
+        total = prompt + output
+    return {
+        "input_tokens": prompt,
+        "output_tokens": output,
+        "cached_tokens": cached,
+        "total_tokens": int(total),
+    }
 
 
 class GeminiProvider(OcrProviderBase):
@@ -18,6 +46,11 @@ class GeminiProvider(OcrProviderBase):
         settings: Settings,
         timeout_seconds: int,
         model_id: str | None = None,
+        cost_session: GeminiCostSession | None = None,
+        cost_page_index: int | None = None,
+        cost_page_in_source: int | None = None,
+        cost_source_file: str | None = None,
+        cost_step: str = "ocr",
     ) -> None:
         if settings.gemini_use_vertexai:
             # Vertex AI accepts EITHER an Agentic Platform / Express API key OR
@@ -50,6 +83,11 @@ class GeminiProvider(OcrProviderBase):
         self._model_name = model_id or settings.gemini_model
         self.timeout_seconds = timeout_seconds
         self._settings = settings
+        self._cost_session = cost_session
+        self._cost_page_index = cost_page_index
+        self._cost_page_in_source = cost_page_in_source
+        self._cost_source_file = cost_source_file or ""
+        self._cost_step = cost_step
 
     def transcribe(
         self,
@@ -57,6 +95,7 @@ class GeminiProvider(OcrProviderBase):
         image_bytes: bytes,
         mime_type: str,
         system_prompt: str,
+        user_prompt: str | None = None,
         few_shots: list[FewShotPair],
     ) -> str:
         logger.info(
@@ -75,8 +114,10 @@ class GeminiProvider(OcrProviderBase):
             )
             contents.append(f"Expected transcription:\n{shot.expected_text}")
 
+        prefix = user_instructions_prefix(user_prompt)
         contents.append(
-            "Transcribe the following image. Preserve Devanāgarī, IAST diacritics, "
+            prefix
+            + "Transcribe the following image. Preserve Devanāgarī, IAST diacritics, "
             "anusvāra/visarga, all svaras (Udātta, Anudātta, Svarita, kampas, etc.), "
             "and punctuation exactly as printed or implied by the scan. "
             "Output plain text only, no commentary."
@@ -98,6 +139,33 @@ class GeminiProvider(OcrProviderBase):
         except Exception:
             logger.exception("Gemini API call failed: model=%s", self._model_name)
             raise
+
+        usage = _usage_from_response(response)
+        if self._cost_session is not None and self._cost_page_index is not None:
+            self._cost_session.record_call(
+                page_index=self._cost_page_index,
+                page_in_source=self._cost_page_in_source,
+                source_file=self._cost_source_file,
+                step=self._cost_step,
+                input_tokens=usage["input_tokens"],
+                output_tokens=usage["output_tokens"],
+                cached_tokens=usage["cached_tokens"],
+                total_tokens=usage["total_tokens"],
+            )
+            logger.info(
+                "Gemini cost recorded: job=%s page=%s in=%d out=%d",
+                self._cost_session.job_id,
+                self._cost_page_index,
+                usage["input_tokens"],
+                usage["output_tokens"],
+            )
+        elif usage["input_tokens"] or usage["output_tokens"]:
+            logger.debug(
+                "Gemini tokens (no cost session): model=%s in=%d out=%d",
+                self._model_name,
+                usage["input_tokens"],
+                usage["output_tokens"],
+            )
 
         text = getattr(response, "text", None)
         if text:

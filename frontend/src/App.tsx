@@ -1,5 +1,6 @@
 import { Document, Packer, Paragraph, TextRun } from 'docx'
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { apiUrl } from './apiBase'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -114,6 +115,72 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`
 }
 
+const RULE = '='.repeat(70)
+const PAGE_RULE = '▬'.repeat(70)
+
+function resolvePageNumber(page: OcrPage): number {
+  return page.page_in_source ?? page.index + 1
+}
+
+function pageSortKey(a: OcrPage, b: OcrPage): number {
+  const fileCmp = a.source_file.localeCompare(b.source_file)
+  if (fileCmp !== 0) return fileCmp
+  const aNum = resolvePageNumber(a)
+  const bNum = resolvePageNumber(b)
+  if (aNum !== bNum) return aNum - bNum
+  return a.index - b.index
+}
+
+/** Marker block matching pdfToGeminiRangeSpecific.py: ▬×70, PAGE N, ▬×70, blank line */
+function formatPageMarkerBlock(pageNum: number): string {
+  return `\n${PAGE_RULE}\nPAGE ${pageNum}\n${PAGE_RULE}\n\n`
+}
+
+function formatConsolidatedOcrText(
+  pages: OcrPage[],
+  meta?: {
+    sourceFiles?: string[]
+    provider?: string
+    elapsedSecs?: number | null
+  },
+): string {
+  const sorted = [...pages].sort(pageSortKey)
+  const uniqueSources = new Set(sorted.map((p) => p.source_file).filter(Boolean))
+  const multiSource = uniqueSources.size > 1
+  const now = new Date()
+  const procDate = now.toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, ' UTC')
+
+  const lines: string[] = [
+    RULE,
+    'VEDIC OCR OUTPUT',
+    `Source file(s): ${meta?.sourceFiles?.length ? meta.sourceFiles.join(', ') : '(this session)'}`,
+    `Processing date: ${procDate}`,
+  ]
+  if (meta?.provider) lines.push(`Provider: ${meta.provider}`)
+  if (meta?.elapsedSecs != null) lines.push(`Elapsed: ${meta.elapsedSecs.toFixed(1)} s`)
+  lines.push(`Pages: ${sorted.length}`, RULE, '')
+
+  let body = ''
+  for (const page of sorted) {
+    const num = resolvePageNumber(page)
+    const text = page.text.trim() || '[ERROR: Page OCR produced no text]'
+    if (multiSource && page.source_file) {
+      body += `\n${PAGE_RULE}\nPAGE ${num} — ${page.source_file}\n${PAGE_RULE}\n\n${text}\n`
+    } else {
+      body += formatPageMarkerBlock(num) + text + '\n'
+    }
+  }
+
+  const footer =
+    `\n${RULE}\n` +
+    `END OF OCR OUTPUT\n` +
+    `Total pages processed: ${sorted.length}\n` +
+    `Completion time: ${procDate}\n` +
+    `${RULE}\n`
+
+  return lines.join('\n') + '\n' + body + footer
+}
+
 function downloadStamp(): string {
   const d = new Date()
   return (
@@ -156,7 +223,7 @@ export default function App() {
   const modelOptionsDatalistId = useId()
   const modelInputId = useId()
   const providerSelectId = useId()
-  const systemPromptId = useId()
+  const userPromptId = useId()
 
   const mainInputRef = useRef<HTMLInputElement>(null)
   // Track provider in a ref so SSE callbacks don't go stale
@@ -169,9 +236,8 @@ export default function App() {
   const [provider, setProvider] = useState<string>('gemini')
   const [modelIdValue, setModelIdValue] = useState('')
 
-  // ── System prompt ──────────────────────────────────────────────────────────
-  const [systemPrompt, setSystemPrompt] = useState('')
-  const defaultPromptFetched = useRef(false)
+  // ── Optional user instructions (default protocol is applied server-side) ───
+  const [userPrompt, setUserPrompt] = useState('')
 
   // ── Few-shots ──────────────────────────────────────────────────────────────
   const [fewShots, setFewShots] = useState<FewShotRow[]>([])
@@ -182,12 +248,15 @@ export default function App() {
 
   // ── Job / streaming ────────────────────────────────────────────────────────
   const [loading, setLoading] = useState(false)
+  const [preparing, setPreparing] = useState(false)
   const [currentJobId, setCurrentJobId] = useState<string | null>(null)
   const [pages, setPages] = useState<OcrPage[]>([])
   const [pagesDone, setPagesDone] = useState(0)
   const [pagesTotal, setPagesTotal] = useState(0)
   const [streamDone, setStreamDone] = useState(false)
   const [elapsedSecs, setElapsedSecs] = useState<number | null>(null)
+  const [resultSourceFiles, setResultSourceFiles] = useState<string[]>([])
+  const [serverCombinedText, setServerCombinedText] = useState<string | null>(null)
 
   // ── UI ─────────────────────────────────────────────────────────────────────
   const [error, setError] = useState<string | null>(null)
@@ -205,7 +274,7 @@ export default function App() {
 
   // ── Fetch provider list ────────────────────────────────────────────────────
   useEffect(() => {
-    fetch('/api/providers')
+    fetch(apiUrl('providers'))
       .then((r) => r.json())
       .then((body: { providers: ProviderRow[] }) => {
         const list = body.providers ?? []
@@ -219,34 +288,15 @@ export default function App() {
       .catch(() => setProviders([]))
   }, [])
 
-  // ── Fetch default system prompt ────────────────────────────────────────────
+  // ── Poll vLLM status (only when provider = vllm_dots) ─────────────────────
   useEffect(() => {
-    if (defaultPromptFetched.current) return
-    defaultPromptFetched.current = true
-    fetch('/api/ocr/defaults')
-      .then((r) => r.json())
-      .then((body: { default_system_prompt?: string }) => {
-        if (body.default_system_prompt) setSystemPrompt(body.default_system_prompt)
-      })
-      .catch(() => {
-        setSystemPrompt(
-          'You are an expert paleographer for Vedic and Sanskrit manuscripts.\n' +
-          'Transcribe printed or handwritten Śruti/Smṛti text with maximal fidelity.\n' +
-          'Preserve Devanāgarī conjuncts, daṇḍas, numerals, markers, and diacritic-rich Latin (IAST) if present.\n' +
-          'Keep Udātta, Anudātta, Svarita, and kampas exactly as in the source. No commentary—plain text only.',
-        )
-      })
-  }, [])
-
-  // ── Poll vLLM status (only when provider = vllm_gemma) ────────────────────
-  useEffect(() => {
-    if (provider !== 'vllm_gemma') {
+    if (provider !== 'vllm_dots') {
       setVllmStatus(null)
       return
     }
     let cancelled = false
     const poll = () => {
-      fetch('/api/vllm/status')
+      fetch(apiUrl('vllm/status'))
         .then((r) => r.json())
         .then((s: VllmStatus) => { if (!cancelled) setVllmStatus(s) })
         .catch(() => { if (!cancelled) setVllmStatus(null) })
@@ -262,13 +312,13 @@ export default function App() {
   // ── vLLM actions ───────────────────────────────────────────────────────────
   const vllmLoad = useCallback(async () => {
     setVllmBusy(true)
-    try { await fetch('/api/vllm/load', { method: 'POST' }) }
+    try { await fetch(apiUrl('vllm/load'), { method: 'POST' }) }
     finally { setVllmBusy(false) }
   }, [])
 
   const vllmUnload = useCallback(async () => {
     setVllmBusy(true)
-    try { await fetch('/api/vllm/unload', { method: 'POST' }) }
+    try { await fetch(apiUrl('vllm/unload'), { method: 'POST' }) }
     finally { setVllmBusy(false) }
   }, [])
 
@@ -354,16 +404,56 @@ export default function App() {
 
   const canSubmit = mainFiles.length > 0 && !loading && fewShotOk
 
-  const combinedText = useMemo(
-    () =>
-      [...pages]
-        .sort((a, b) => a.index - b.index)
-        .map((p) => p.text)
-        .join('\n\n'),
-    [pages],
-  )
+  const combinedText = useMemo(() => {
+    if (serverCombinedText) return serverCombinedText
+    if (pages.length === 0) return ''
+    return formatConsolidatedOcrText(pages, {
+      sourceFiles:
+        resultSourceFiles.length > 0
+          ? resultSourceFiles
+          : mainFiles.map((f) => f.name),
+      provider,
+      elapsedSecs: elapsedSecs,
+    })
+  }, [serverCombinedText, pages, resultSourceFiles, mainFiles, provider, elapsedSecs])
 
   const hasResult = combinedText.length > 0
+
+  // ── Poll saved results (stream drop / refresh while job still runs server-side) ─
+  const pollJobResult = useCallback(async (jobId: string) => {
+    const r = await fetch(apiUrl(`ocr/${jobId}/result`))
+    if (!r.ok) return null
+    return r.json() as Promise<{
+      pages?: OcrPage[]
+      files?: string[]
+      provider?: string | null
+      elapsed_seconds?: number | null
+      combined_text?: string
+      done?: boolean
+    }>
+  }, [])
+
+  const applyJobResult = useCallback(
+    (body: {
+      pages?: OcrPage[]
+      files?: string[]
+      provider?: string | null
+      elapsed_seconds?: number | null
+      combined_text?: string
+    }) => {
+      const sorted = [...(body.pages ?? [])].sort(pageSortKey)
+      if (sorted.length) setPages(sorted)
+      if (body.files?.length) setResultSourceFiles(body.files)
+      if (body.combined_text?.trim()) setServerCombinedText(body.combined_text)
+      if (body.provider) setProvider(body.provider)
+      if (body.elapsed_seconds != null) setElapsedSecs(body.elapsed_seconds)
+      if (sorted.length) {
+        setPagesTotal(sorted.length)
+        setPagesDone(sorted.length)
+      }
+    },
+    [],
+  )
 
   // ── Cancel ─────────────────────────────────────────────────────────────────
   const handleCancel = useCallback(() => {
@@ -372,18 +462,28 @@ export default function App() {
       esRef.current = null
     }
     setLoading(false)
+    setPreparing(false)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (esRef.current) {
+        esRef.current.close()
+        esRef.current = null
+      }
+    }
   }, [])
 
   // ── Submit ─────────────────────────────────────────────────────────────────
   const submit = async () => {
     setError(null)
-    setPages([])
     setPagesDone(0)
     setPagesTotal(0)
     setStreamDone(false)
     setElapsedSecs(null)
-    setCurrentJobId(null)
+    setPreparing(true)
     setCopyDone(false)
+    setResultSourceFiles(mainFiles.map((f) => f.name))
 
     if (!mainFiles.length) {
       setError('Add at least one PDF or image to transcribe.')
@@ -401,8 +501,18 @@ export default function App() {
     mainFiles.forEach((f) => fd.append('files', f))
     fd.append('provider', provider)
     const mid = modelIdValue.trim()
-    if (mid) fd.append('model_id', mid)
-    fd.append('system_prompt', systemPrompt)
+    const allowedModels = providers.find((p) => p.id === provider)?.model_options ?? []
+    // vLLM only accepts served names (e.g. "model"); ignore a stale Gemini/Bedrock id.
+    if (mid) {
+      if (provider === 'vllm_dots') {
+        if (!allowedModels.length || allowedModels.includes(mid)) {
+          fd.append('model_id', mid)
+        }
+      } else {
+        fd.append('model_id', mid)
+      }
+    }
+    if (userPrompt.trim()) fd.append('user_prompt', userPrompt.trim())
     fd.append(
       'few_shots',
       JSON.stringify(
@@ -420,7 +530,7 @@ export default function App() {
     // Step 1: POST to enqueue the job
     let jobId: string
     try {
-      const res = await fetch('/api/ocr', { method: 'POST', body: fd })
+      const res = await fetch(apiUrl('ocr'), { method: 'POST', body: fd })
       const body = await res.json().catch(() => ({}))
       if (!res.ok) {
         const detail =
@@ -437,23 +547,38 @@ export default function App() {
     } catch (e) {
       setError(e instanceof Error ? e.message : 'OCR request failed')
       setLoading(false)
+      setPreparing(false)
       return
     }
+
+    setPreparing(false)
 
     // Step 2: open SSE stream
     // Capture snapshot of mutable values for use in callbacks
     const firstFilename = mainFiles[0]?.name ?? 'unknown'
     const submittedProvider = providerRef.current
 
-    const es = new EventSource(`/api/ocr/${jobId}/stream`)
+    const es = new EventSource(apiUrl(`ocr/${jobId}/stream`))
     esRef.current = es
     let isDone = false
 
     es.addEventListener('start', (e: MessageEvent) => {
       try {
         const d = JSON.parse(e.data) as { total: number }
+        setPages([])
+        setServerCombinedText(null)
         setPagesTotal(d.total)
       } catch { /* ignore parse errors */ }
+    })
+
+    es.addEventListener('error', (e: MessageEvent) => {
+      try {
+        const d = JSON.parse(e.data) as { detail?: string }
+        if (d.detail) {
+          const detail = d.detail
+          setError((prev) => (prev ? `${prev}\n${detail}` : detail))
+        }
+      } catch { /* ignore */ }
     })
 
     es.addEventListener('page', (e: MessageEvent) => {
@@ -492,6 +617,14 @@ export default function App() {
       setStreamDone(true)
       setLoading(false)
 
+      // Prefer server-built file (includes PAGE markers) once job is done
+      fetch(apiUrl(`ocr/${jobId}/result`))
+        .then((r) => (r.ok ? r.json() : null))
+        .then((body: { combined_text?: string } | null) => {
+          if (body?.combined_text?.trim()) setServerCombinedText(body.combined_text)
+        })
+        .catch(() => {})
+
       // Persist job to localStorage
       setSavedJobs(
         upsertSavedJob({
@@ -508,10 +641,35 @@ export default function App() {
       // After 'done', the server closes the connection — browser fires onerror.
       // That's normal; ignore it if we already handled 'done'.
       if (isDone || es.readyState === EventSource.CLOSED) return
-      setError('Stream connection lost. Any partial results are shown above.')
       es.close()
       esRef.current = null
       setLoading(false)
+
+      // Job may still be running server-side; poll saved results.
+      void (async () => {
+        for (let i = 0; i < 120; i++) {
+          await new Promise((r) => window.setTimeout(r, 3000))
+          const body = await pollJobResult(jobId)
+          if (!body) continue
+          applyJobResult(body)
+          if (body.done || (body.pages?.length ?? 0) > 0) {
+            if (body.done) {
+              setStreamDone(true)
+              setError((prev) =>
+                prev
+                  ? prev
+                  : 'Live stream ended; showing saved results from the server.',
+              )
+            }
+            if (body.done) return
+          }
+        }
+        setError((prev) =>
+          prev
+            ? prev
+            : 'Stream connection lost. Check Recent jobs or retry — the server may still be processing.',
+        )
+      })()
     }
   }
 
@@ -537,11 +695,21 @@ export default function App() {
     setElapsedSecs(null)
     setCurrentJobId(job_id)
     try {
-      const r = await fetch(`/api/ocr/${job_id}/result`)
+      const r = await fetch(apiUrl(`ocr/${job_id}/result`))
       if (!r.ok) throw new Error(`HTTP ${r.status}`)
-      const body = await r.json() as { pages?: OcrPage[] }
-      const sorted = [...(body.pages ?? [])].sort((a, b) => a.index - b.index)
+      const body = await r.json() as {
+        pages?: OcrPage[]
+        files?: string[]
+        provider?: string | null
+        elapsed_seconds?: number | null
+        combined_text?: string
+      }
+      const sorted = [...(body.pages ?? [])].sort(pageSortKey)
       setPages(sorted)
+      setResultSourceFiles(body.files ?? [])
+      setServerCombinedText(body.combined_text?.trim() ? body.combined_text : null)
+      if (body.provider) setProvider(body.provider)
+      if (body.elapsed_seconds != null) setElapsedSecs(body.elapsed_seconds)
       setPagesTotal(sorted.length)
       setPagesDone(sorted.length)
       setStreamDone(true)
@@ -572,7 +740,7 @@ export default function App() {
               <h1>Vedic OCR Studio</h1>
               <p>
                 Production-grade multimodal OCR for Devanāgarī, dense diacritics, and Vedic svaras
-                on difficult scans. Route to Gemini, Claude on Bedrock, or local Gemma 4.
+                on difficult scans. Route to Gemini, Claude on Bedrock, or local dots.ocr.
               </p>
             </div>
           </div>
@@ -633,7 +801,7 @@ export default function App() {
                     <option value="gemini">Google Gemini</option>
                     <option value="bedrock_claude">AWS Bedrock — Claude</option>
                     <option value="bedrock_ocr">AWS Bedrock — Open multimodal</option>
-                    <option value="vllm_gemma">Local — Gemma 4 (vLLM)</option>
+                    <option value="vllm_dots">Local — dots.ocr (vLLM)</option>
                   </>
                 )}
               </select>
@@ -671,13 +839,14 @@ export default function App() {
                 ))}
               </datalist>
               <p id="model-hint" className="field-note">
-                Pick a suggestion or type any model ID your backend supports. Empty uses the server
-                default for the selected provider.
+                {provider === 'vllm_dots'
+                  ? 'Use the served name (usually "model"). Gemini/Bedrock IDs are ignored for local OCR.'
+                  : 'Pick a suggestion or type any model ID your backend supports. Empty uses the server default.'}
               </p>
 
               {/* vLLM status panel — only shown when using the local model */}
-              {provider === 'vllm_gemma' && (
-                <div className="vllm-panel" aria-label="vLLM server status">
+              {provider === 'vllm_dots' && (
+                <div className="vllm-panel" aria-label="dots.ocr vLLM server status">
                   <div className="vllm-panel__row">
                     <span
                       className={`status-dot status-dot--${vllmState}`}
@@ -798,22 +967,28 @@ export default function App() {
           </div>
         </section>
 
-        {/* ── System instructions ────────────────────────────────────────── */}
+        {/* ── Optional user instructions ─────────────────────────────────── */}
         <section className="card" aria-labelledby="section-prompt">
           <div className="card__header">
             <h2 id="section-prompt" className="card__title">
-              System instructions
+              Your instructions
             </h2>
           </div>
+          <p className="card__hint">
+            Optional. The full ĀrṣaDṛṣṭi transcription protocol is applied automatically on
+            every page. Add notes here only when you need to override or extend that behavior
+            (e.g. include the masthead, single-column layout, edition-specific rules).
+          </p>
           <div className="field">
-            <label className="field-label" htmlFor={systemPromptId}>
-              Prompt sent with every page
+            <label className="field-label" htmlFor={userPromptId}>
+              Additional instructions (sent with each page)
             </label>
             <textarea
-              id={systemPromptId}
-              value={systemPrompt}
-              onChange={(e) => setSystemPrompt(e.target.value)}
-              rows={8}
+              id={userPromptId}
+              value={userPrompt}
+              onChange={(e) => setUserPrompt(e.target.value)}
+              rows={6}
+              placeholder="Leave empty to use the default transcription protocol only."
             />
           </div>
         </section>
@@ -924,7 +1099,11 @@ export default function App() {
                     marginRight: 0,
                   }}
                 />
-                {pagesTotal > 0 ? `${pagesDone} / ${pagesTotal} pages` : 'Starting…'}
+                {pagesTotal > 0
+                  ? `${pagesDone} / ${pagesTotal} pages`
+                  : preparing
+                    ? 'Uploading & preparing PDF…'
+                    : 'Starting…'}
               </span>
             </>
           ) : (
@@ -947,14 +1126,14 @@ export default function App() {
                 <>
                   <a
                     className="btn"
-                    href={`/api/ocr/${currentJobId}/download.txt`}
+                    href={apiUrl(`ocr/${currentJobId}/download.txt`)}
                     download
                   >
                     Download .txt
                   </a>
                   <a
                     className="btn"
-                    href={`/api/ocr/${currentJobId}/download.docx`}
+                    href={apiUrl(`ocr/${currentJobId}/download.docx`)}
                     download
                   >
                     Download .docx
@@ -1068,14 +1247,14 @@ export default function App() {
                     </button>
                     <a
                       className="btn btn--sm"
-                      href={`/api/ocr/${job.job_id}/download.txt`}
+                      href={apiUrl(`ocr/${job.job_id}/download.txt`)}
                       download
                     >
                       .txt
                     </a>
                     <a
                       className="btn btn--sm"
-                      href={`/api/ocr/${job.job_id}/download.docx`}
+                      href={apiUrl(`ocr/${job.job_id}/download.docx`)}
                       download
                     >
                       .docx

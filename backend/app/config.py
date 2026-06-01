@@ -12,6 +12,11 @@ def _default_upload_storage_dir() -> str:
     return str((backend_root / "data" / "uploads").resolve())
 
 
+def _default_gemini_cost_ledger_dir() -> str:
+    backend_root = Path(__file__).resolve().parents[1]
+    return str((backend_root / "data" / "gemini_costs").resolve())
+
+
 def _comma_separated_nonempty(raw: str | None) -> list[str]:
     if not raw or not raw.strip():
         return []
@@ -112,8 +117,9 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("VLLM_BASE_URL", "vllm_base_url"),
     )
     vllm_model: str = Field(
-        default="nvidia/Gemma-4-31B-IT-NVFP4",
+        default="model",
         validation_alias=AliasChoices("VLLM_MODEL", "vllm_model"),
+        description="vLLM --served-model-name (dots.ocr default: model)",
     )
     vllm_model_options: str | None = Field(
         default=None,
@@ -144,6 +150,57 @@ class Settings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("VLLM_WARMUP_ON_LOAD", "vllm_warmup_on_load"),
     )
+    # Must match docker-compose --max-model-len (VLLM_MAX_MODEL_LEN).
+    vllm_max_model_len: int = Field(
+        default=4096,
+        validation_alias=AliasChoices("VLLM_MAX_MODEL_LEN", "vllm_max_model_len"),
+    )
+    # Cap completion tokens; default leaves room for system prompt + image (~3k input).
+    vllm_max_output_tokens: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices("VLLM_MAX_OUTPUT_TOKENS", "vllm_max_output_tokens"),
+    )
+    vllm_input_token_reserve: int = Field(
+        default=3200,
+        validation_alias=AliasChoices(
+            "VLLM_INPUT_TOKEN_RESERVE", "vllm_input_token_reserve"
+        ),
+    )
+    # dots.ocr pipeline defaults (``run_ocr_pipeline.py`` / ``ocr_pipeline/``).
+    vllm_pdf_dpi: int = Field(
+        default=150,
+        validation_alias=AliasChoices("VLLM_PDF_DPI", "vllm_pdf_dpi"),
+        description=(
+            "PDF rasterization DPI for vllm_dots. "
+            "150 fits a 4096 context; 250 needs VLLM_MAX_MODEL_LEN>=8192."
+        ),
+    )
+    vllm_preprocess_images: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "VLLM_PREPROCESS_IMAGES", "vllm_preprocess_images"
+        ),
+    )
+    vllm_temperature: float = Field(
+        default=0.1,
+        validation_alias=AliasChoices("VLLM_TEMPERATURE", "vllm_temperature"),
+    )
+    vllm_top_p: float = Field(
+        default=0.9,
+        validation_alias=AliasChoices("VLLM_TOP_P", "vllm_top_p"),
+    )
+    vllm_prompt_file: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("VLLM_PROMPT_FILE", "vllm_prompt_file"),
+        description="Optional prompt.txt (PROMPT = '''...''') like the standalone pipeline",
+    )
+    vllm_use_full_system_prompt: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "VLLM_USE_FULL_SYSTEM_PROMPT", "vllm_use_full_system_prompt"
+        ),
+        description="Use full ĀrṣaDṛṣṭi prompt; needs high VLLM_MAX_MODEL_LEN",
+    )
 
     cors_origins: str = Field(
         default="http://localhost:5173,http://127.0.0.1:5173",
@@ -163,8 +220,25 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("UPLOAD_RETAIN_HOURS", "upload_retain_hours"),
     )
 
+    # Gemini cost accounting (persistent administrator ledger)
+    gemini_cost_log_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("GEMINI_COST_LOG_ENABLED", "gemini_cost_log_enabled"),
+    )
+    gemini_cost_ledger_dir: str = Field(
+        default_factory=_default_gemini_cost_ledger_dir,
+        validation_alias=AliasChoices("GEMINI_COST_LEDGER_DIR", "gemini_cost_ledger_dir"),
+    )
+    admin_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("ADMIN_API_KEY", "admin_api_key"),
+    )
+
     def upload_root_path(self) -> Path:
         return Path(self.upload_storage_dir).expanduser().resolve()
+
+    def gemini_cost_ledger_path(self) -> Path:
+        return (Path(self.gemini_cost_ledger_dir).expanduser().resolve() / "ledger.jsonl")
 
     def gemini_models_for_providers(self) -> tuple[str | None, list[str]]:
         default = self.gemini_model
@@ -188,6 +262,14 @@ class Settings(BaseSettings):
             + ([d] if d else [])
         )
         return d, opts
+
+    def vllm_effective_max_output_tokens(self) -> int:
+        if self.vllm_max_output_tokens is not None:
+            return max(128, self.vllm_max_output_tokens)
+        return max(
+            128,
+            min(8192, self.vllm_max_model_len - self.vllm_input_token_reserve),
+        )
 
     def vllm_models_for_providers(self) -> tuple[str | None, list[str]]:
         default = self.vllm_model

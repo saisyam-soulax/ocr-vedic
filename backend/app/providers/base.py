@@ -31,6 +31,7 @@ class OcrProviderBase(ABC):
         image_bytes: bytes,
         mime_type: str,
         system_prompt: str,
+        user_prompt: str | None = None,
         few_shots: list[FewShotPair],
     ) -> str:
         raise NotImplementedError
@@ -60,15 +61,20 @@ def transcribe_with_provider(
     image_bytes: bytes,
     mime_type: str,
     system_prompt: str,
+    user_prompt: str | None = None,
     few_shots: list[dict[str, str]],
     settings: Settings,
     model_id: str | None = None,
+    gemini_cost_session: object | None = None,
+    gemini_cost_page_index: int | None = None,
+    gemini_cost_page_in_source: int | None = None,
+    gemini_cost_source_file: str | None = None,
 ) -> str:
     """Synchronous dispatch — used directly or via run_in_executor."""
     from app.providers.bedrock_claude import BedrockClaudeProvider
     from app.providers.bedrock_open import BedrockOpenMultimodalProvider
     from app.providers.gemini import GeminiProvider
-    from app.providers.vllm_gemma import VllmGemmaProvider
+    from app.providers.vllm_dots import VllmDotsProvider
     from app.schemas import OcrProvider
 
     parsed = OcrProvider(provider_name)
@@ -76,18 +82,26 @@ def transcribe_with_provider(
 
     timeout = (
         settings.vllm_request_timeout_seconds
-        if parsed == OcrProvider.vllm_gemma
+        if parsed == OcrProvider.vllm_dots
         else settings.ocr_request_timeout_seconds
     )
 
     if parsed == OcrProvider.gemini:
-        impl: OcrProviderBase = GeminiProvider(settings=settings, timeout_seconds=timeout, model_id=model_id)
+        impl: OcrProviderBase = GeminiProvider(
+            settings=settings,
+            timeout_seconds=timeout,
+            model_id=model_id,
+            cost_session=gemini_cost_session,
+            cost_page_index=gemini_cost_page_index,
+            cost_page_in_source=gemini_cost_page_in_source,
+            cost_source_file=gemini_cost_source_file,
+        )
     elif parsed == OcrProvider.bedrock_claude:
         impl = BedrockClaudeProvider(settings=settings, timeout_seconds=timeout, model_id=model_id)
     elif parsed == OcrProvider.bedrock_ocr:
         impl = BedrockOpenMultimodalProvider(settings=settings, timeout_seconds=timeout, model_id=model_id)
-    elif parsed == OcrProvider.vllm_gemma:
-        impl = VllmGemmaProvider(settings=settings, timeout_seconds=timeout, model_id=model_id)
+    elif parsed == OcrProvider.vllm_dots:
+        impl = VllmDotsProvider(settings=settings, timeout_seconds=timeout, model_id=model_id)
     else:
         raise ValueError(f"Unsupported provider: {provider_name}")
 
@@ -95,6 +109,7 @@ def transcribe_with_provider(
         image_bytes=image_bytes,
         mime_type=mime_type,
         system_prompt=system_prompt,
+        user_prompt=user_prompt,
         few_shots=pairs,
     )
 
@@ -105,9 +120,14 @@ async def transcribe_with_provider_async(
     image_bytes: bytes,
     mime_type: str,
     system_prompt: str,
+    user_prompt: str | None = None,
     few_shots: list[dict[str, str]],
     settings: Settings,
     model_id: str | None = None,
+    gemini_cost_session: object | None = None,
+    gemini_cost_page_index: int | None = None,
+    gemini_cost_page_in_source: int | None = None,
+    gemini_cost_source_file: str | None = None,
 ) -> str:
     """Async dispatch.
 
@@ -119,11 +139,11 @@ async def transcribe_with_provider_async(
 
     parsed = OcrProvider(provider_name)
 
-    if parsed == OcrProvider.vllm_gemma:
-        from app.providers.vllm_gemma import VllmGemmaProvider
+    if parsed == OcrProvider.vllm_dots:
+        from app.providers.vllm_dots import VllmDotsProvider
 
         pairs = _build_pairs(few_shots)
-        impl = VllmGemmaProvider(
+        impl = VllmDotsProvider(
             settings=settings,
             timeout_seconds=settings.vllm_request_timeout_seconds,
             model_id=model_id,
@@ -132,6 +152,7 @@ async def transcribe_with_provider_async(
             image_bytes=image_bytes,
             mime_type=mime_type,
             system_prompt=system_prompt,
+            user_prompt=user_prompt,
             few_shots=pairs,
         )
 
@@ -143,9 +164,14 @@ async def transcribe_with_provider_async(
         image_bytes=image_bytes,
         mime_type=mime_type,
         system_prompt=system_prompt,
+        user_prompt=user_prompt,
         few_shots=few_shots,
         settings=settings,
         model_id=model_id,
+        gemini_cost_session=gemini_cost_session,
+        gemini_cost_page_index=gemini_cost_page_index,
+        gemini_cost_page_in_source=gemini_cost_page_in_source,
+        gemini_cost_source_file=gemini_cost_source_file,
     )
     return await loop.run_in_executor(None, fn)
 
@@ -157,6 +183,7 @@ def transcribe_image(
     few_shot_examples: list[dict[str, str]],
     provider: str,
     *,
+    user_prompt: str | None = None,
     settings: Settings | None = None,
     model_id: str | None = None,
 ) -> str:
@@ -167,6 +194,7 @@ def transcribe_image(
         image_bytes=image_bytes,
         mime_type=mime_type,
         system_prompt=system_prompt,
+        user_prompt=user_prompt,
         few_shots=few_shot_examples,
         settings=settings or get_settings(),
         model_id=model_id,

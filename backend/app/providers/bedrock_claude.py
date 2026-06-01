@@ -7,6 +7,7 @@ from botocore.config import Config
 
 from app.config import Settings
 from app.providers.base import FewShotPair, OcrProviderBase
+from app.providers.prompts import user_instructions_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,7 @@ class BedrockClaudeProvider(OcrProviderBase):
         image_bytes: bytes,
         mime_type: str,
         system_prompt: str,
+        user_prompt: str | None = None,
         few_shots: list[FewShotPair],
     ) -> str:
         logger.info(
@@ -98,12 +100,14 @@ class BedrockClaudeProvider(OcrProviderBase):
                 {"role": "assistant", "content": [_text_part(shot.expected_text)]}
             )
 
+        prefix = user_instructions_prefix(user_prompt)
         messages.append(
             {
                 "role": "user",
                 "content": [
                     _text_part(
-                        "Transcribe this manuscript page. Preserve Devanāgarī, Latin diacritics, "
+                        prefix
+                        + "Transcribe this manuscript page. Preserve Devanāgarī, Latin diacritics, "
                         "and all Vedic accent/svara marks. Plain text only, no commentary."
                     ),
                     _image_part(image_bytes, mime_type),

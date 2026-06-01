@@ -12,16 +12,21 @@ import logging
 import re
 import shutil
 import time
+from functools import partial
 from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import HTTPException, UploadFile
 
 from app.config import Settings, get_settings
+from app.cost.gemini_ledger import finalize_gemini_job_costs, start_gemini_cost_session
 from app.providers.base import transcribe_with_provider, transcribe_with_provider_async
 from app.schemas import OcrPageResult, OcrProvider
 from app.storage_uploads import sniff_is_pdf
-from app.utils.pdf import pdf_bytes_to_page_images
+from app.utils.image_preprocess import preprocess_image_bytes
+from app.utils.output_format import format_consolidated_ocr_text, resolve_page_number
+from app.utils.pdf import pdf_page_count, pdf_page_to_image
+from app.utils.vllm_prompt import load_prompt_from_file
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +40,46 @@ _IMAGE_RE = re.compile(r"\.(png|jpe?g|webp|gif|tiff?)$", re.IGNORECASE)
 def get_default_system_prompt() -> str:
     """Default OCR system prompt (also exposed via GET /api/ocr/defaults for the UI)."""
     return _default_system_prompt_body()
+
+
+def get_system_prompt_for_provider(
+    provider: str, settings: Settings | None = None
+) -> str:
+    """Provider-specific system prompt.
+
+    For ``vllm_dots``: optional ``VLLM_PROMPT_FILE`` (same ``prompt.txt`` format as
+    ``run_ocr_pipeline.py``), else compact prompt unless ``VLLM_USE_FULL_SYSTEM_PROMPT``.
+    """
+    if settings is None:
+        settings = get_settings()
+    if provider != OcrProvider.vllm_dots.value:
+        return _default_system_prompt_body()
+    if settings.vllm_prompt_file:
+        path = Path(settings.vllm_prompt_file).expanduser()
+        if path.is_file():
+            return load_prompt_from_file(path)
+    if settings.vllm_use_full_system_prompt:
+        return _default_system_prompt_body()
+    return _vllm_compact_system_prompt()
+
+
+def effective_ocr_pdf_dpi(settings: Settings, provider: str) -> int:
+    """dots.ocr pipeline rasterizes at 250 DPI by default (``ocr_pipeline/pdf_render``)."""
+    if provider == OcrProvider.vllm_dots.value:
+        return settings.vllm_pdf_dpi
+    return settings.ocr_pdf_dpi
+
+
+def _vllm_compact_system_prompt() -> str:
+    return (
+        "You are ĀrṣaDṛṣṭi (आर्षदृष्टि), a Vedic Sanskrit OCR engine. "
+        "Produce a character-perfect facsimile: every akṣara, svara (॑ ॒ ᳚ ᳛), "
+        "anusvāra/visarga, alaṅkāra, punctuation (। ॥ ॰), and line break. "
+        "Read in zone order: skip masthead band; transcribe left/main column top-to-bottom, "
+        "then right column if present, then footnotes. "
+        "Place each wavy demarcator on its own line. "
+        "Output plain UTF-8 text only — no markdown, JSON, or commentary."
+    )
 
 
 def _default_system_prompt_body() -> str:
@@ -343,7 +388,7 @@ async def run_ocr_job(
     queue: asyncio.Queue,
     saved_files: list[tuple[Path, str, str | None]],
     provider: str,
-    system_prompt: str | None,
+    user_prompt: str | None,
     few_shots: list[dict[str, str]],
     settings: Settings,
     model_id: str | None,
@@ -364,21 +409,34 @@ async def run_ocr_job(
     """
     start_time = time.monotonic()
     total = 0
+    gemini_cost_session = None
+    if (
+        provider == OcrProvider.gemini.value
+        and settings.gemini_cost_log_enabled
+    ):
+        resolved_model = model_id or settings.gemini_model
+        gemini_cost_session = start_gemini_cost_session(
+            job_id=batch_dir.name,
+            batch_dir=batch_dir,
+            model=resolved_model,
+        )
 
     try:
         total = await _run(
             queue=queue,
             saved_files=saved_files,
             provider=provider,
-            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             few_shots=few_shots,
             settings=settings,
             model_id=model_id,
             batch_dir=batch_dir,
+            gemini_cost_session=gemini_cost_session,
         )
     except Exception as exc:
         logger.exception("Fatal error in OCR job")
         await queue.put({"event": "error", "detail": str(exc)})
+        await queue.put({"event": "done", "total": total, "elapsed_seconds": 0})
     finally:
         elapsed = round(time.monotonic() - start_time, 2)
         logger.info("OCR job finished: elapsed=%.2fs", elapsed)
@@ -407,6 +465,19 @@ async def run_ocr_job(
         except OSError:
             pass
 
+        _write_consolidated_output(batch_dir, saved_files, elapsed, total)
+
+        finalize_gemini_job_costs(
+            gemini_cost_session,
+            ledger_path=settings.gemini_cost_ledger_path(),
+            elapsed_seconds=elapsed,
+        )
+
+        await queue.put({
+            "event": "done",
+            "total": total,
+            "elapsed_seconds": elapsed,
+        })
         await queue.put(None)  # sentinel — tells the SSE generator to close
 
 
@@ -416,63 +487,156 @@ def _append_result_line(path: Path, line: str) -> None:
         fh.write(line)
 
 
+def _write_page_file(batch_dir: Path, source_name: str, page_num: int, text: str) -> None:
+    stem = Path(source_name).stem
+    path = batch_dir / f"{stem}_Page_{page_num}.txt"
+    path.write_text(text, encoding="utf-8")
+
+
+def _write_consolidated_output(
+    batch_dir: Path,
+    saved_files: list[tuple[Path, str, str | None]],
+    elapsed: float,
+    total: int,
+) -> None:
+    """Persist consolidated OCR .txt with PAGE markers (pdfToGeminiRangeSpecific layout)."""
+    results_path = batch_dir / "results.jsonl"
+    if not results_path.exists():
+        return
+    pages: list[dict] = []
+    for raw in results_path.read_text(encoding="utf-8").splitlines():
+        if raw.strip():
+            try:
+                pages.append(json.loads(raw))
+            except json.JSONDecodeError:
+                pass
+    if not pages:
+        return
+
+    provider = None
+    submitted_at = None
+    completed_at = None
+    meta_path = batch_dir / "metadata.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            provider = meta.get("provider")
+            submitted_at = meta.get("created_at")
+        except (json.JSONDecodeError, OSError):
+            pass
+    complete_path = batch_dir / "job_complete.json"
+    if complete_path.exists():
+        try:
+            info = json.loads(complete_path.read_text(encoding="utf-8"))
+            completed_at = info.get("completed_at")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    source_names = [name for (_, name, _) in saved_files]
+    body = format_consolidated_ocr_text(
+        pages,
+        source_files=source_names,
+        provider=provider,
+        submitted_at=submitted_at,
+        completed_at=completed_at,
+        elapsed_seconds=elapsed,
+    )
+    try:
+        (batch_dir / "ocr_output.txt").write_text(body, encoding="utf-8")
+    except OSError:
+        logger.warning("Could not write consolidated ocr_output.txt for %s", batch_dir)
+
+
 async def _run(
     *,
     queue: asyncio.Queue,
     saved_files: list[tuple[Path, str, str | None]],
     provider: str,
-    system_prompt: str | None,
+    user_prompt: str | None,
     few_shots: list[dict[str, str]],
     settings: Settings,
     model_id: str | None,
     batch_dir: Path,
+    gemini_cost_session: object | None = None,
 ) -> int:
     """Returns total page count."""
     loop = asyncio.get_running_loop()
     results_path = batch_dir / "results.jsonl"
     results_lock = asyncio.Lock()  # guards concurrent appends to results.jsonl
-    syn = system_prompt.strip() if system_prompt else get_default_system_prompt()
+    system_syn = get_system_prompt_for_provider(provider, settings)
+    pdf_dpi = effective_ocr_pdf_dpi(settings, provider)
+    user_extra = (user_prompt or "").strip() or None
 
-    # Phase 1: collect all pages (rasterize PDFs in thread executor).
-    # Each entry: (global_index, source_name, image_bytes, mime_type, page_in_source)
-    pages_info: list[tuple[int, str, bytes, str, int | None]] = []
+    # Phase 1: count pages and emit start before rasterizing (avoids long UI silence on PDFs).
+    # Slot: (global_index, source_name, kind, payload, page_in_source)
+    # kind "image" -> payload is raw bytes; kind "pdf" -> (pdf_bytes, 1-based page_number)
+    page_slots: list[tuple[int, str, str, object, int | None]] = []
 
     for path, name, content_type in saved_files:
         raw = await loop.run_in_executor(None, path.read_bytes)
 
         if sniff_is_pdf(raw, name, content_type):
             try:
-                rendered = await loop.run_in_executor(
-                    None, pdf_bytes_to_page_images, raw, settings.ocr_pdf_dpi
-                )
+                n_pages = await loop.run_in_executor(None, pdf_page_count, raw)
             except Exception as exc:
-                raise RuntimeError(f"Failed to rasterize PDF {name!r}: {exc}") from exc
-            for p in rendered:
-                pages_info.append((
-                    len(pages_info), name, p.image_bytes, p.mime_type, p.page_number
-                ))
+                raise RuntimeError(f"Failed to read PDF {name!r}: {exc}") from exc
+            for page_num in range(1, n_pages + 1):
+                page_slots.append((len(page_slots), name, "pdf", (raw, page_num), page_num))
 
         elif _IMAGE_RE.search(name) or (content_type or "").lower().startswith("image/"):
             mime = _mime_for_upload(name, content_type)
-            pages_info.append((len(pages_info), name, raw, mime, None))
+            page_slots.append((len(page_slots), name, "image", (raw, mime), None))
 
         else:
             raise ValueError(
                 f"Unsupported file type for {name!r}. Upload PDF or images (png, jpeg, webp, gif)."
             )
 
-    total = len(pages_info)
+    total = len(page_slots)
     if total == 0:
         raise ValueError("No pages to process.")
 
-    logger.info("OCR job: provider=%s pages=%d concurrency=%d", provider, total, settings.ocr_page_concurrency)
+    # Local vLLM: one page at a time avoids GPU thrash/OOM on a shared GPU.
+    concurrency = settings.ocr_page_concurrency
+    if provider == OcrProvider.vllm_dots.value:
+        concurrency = 1
+
+    logger.info("OCR job: provider=%s pages=%d concurrency=%d", provider, total, concurrency)
     await queue.put({"event": "start", "total": total})
 
-    # Phase 2: process pages concurrently.
-    semaphore = asyncio.Semaphore(settings.ocr_page_concurrency)
+    # Phase 2: rasterize (per PDF page) and transcribe concurrently.
+    semaphore = asyncio.Semaphore(concurrency)
     done_count = 0
 
-    async def process_one(idx: int, name: str, img: bytes, mime: str, page_in_src: int | None) -> OcrPageResult:
+    async def process_one(
+        idx: int, name: str, kind: str, payload: object, page_in_src: int | None
+    ) -> OcrPageResult:
+        if kind == "pdf":
+            pdf_bytes, page_num = payload  # type: ignore[misc]
+            try:
+                rendered = await loop.run_in_executor(
+                    None, pdf_page_to_image, pdf_bytes, page_num, pdf_dpi
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to rasterize {name!r} page {page_num}: {exc}"
+                ) from exc
+            img, mime = rendered.image_bytes, rendered.mime_type
+        else:
+            raw_bytes, mime = payload  # type: ignore[misc]
+            img = raw_bytes
+
+        if provider == OcrProvider.vllm_dots.value:
+            img, mime = await loop.run_in_executor(
+                None,
+                partial(
+                    preprocess_image_bytes,
+                    img,
+                    mime,
+                    enabled=settings.vllm_preprocess_images,
+                ),
+            )
+
         last_exc: Exception = RuntimeError("no attempts made")
         max_attempts = settings.ocr_page_max_retries + 1
         for attempt in range(max_attempts):
@@ -482,10 +646,15 @@ async def _run(
                         provider,
                         image_bytes=img,
                         mime_type=mime,
-                        system_prompt=syn,
+                        system_prompt=system_syn,
+                        user_prompt=user_extra,
                         few_shots=few_shots,
                         settings=settings,
                         model_id=model_id,
+                        gemini_cost_session=gemini_cost_session,
+                        gemini_cost_page_index=idx,
+                        gemini_cost_page_in_source=page_in_src,
+                        gemini_cost_source_file=name,
                     )
                 return OcrPageResult(
                     index=idx,
@@ -506,8 +675,8 @@ async def _run(
         raise last_exc
 
     tasks = [
-        asyncio.create_task(process_one(idx, name, img, mime, pg))
-        for idx, name, img, mime, pg in pages_info
+        asyncio.create_task(process_one(idx, name, kind, payload, pg))
+        for idx, name, kind, payload, pg in page_slots
     ]
 
     for fut in asyncio.as_completed(tasks):
@@ -518,6 +687,15 @@ async def _run(
             line = json.dumps(page.model_dump()) + "\n"
             async with results_lock:
                 await loop.run_in_executor(None, _append_result_line, results_path, line)
+            page_num = resolve_page_number(page.model_dump())
+            await loop.run_in_executor(
+                None,
+                _write_page_file,
+                batch_dir,
+                page.source_file,
+                page_num,
+                page.text,
+            )
             await queue.put({
                 "event": "page",
                 "data": page.model_dump(),
@@ -535,5 +713,4 @@ async def _run(
                 "total": total,
             })
 
-    await queue.put({"event": "done", "total": total})
     return total

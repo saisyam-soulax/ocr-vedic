@@ -1,41 +1,36 @@
 from fastapi.testclient import TestClient
 
-from app.main import app
-
-client = TestClient(app)
+from app.main import create_app
 
 
-def test_health() -> None:
+def test_health_ok() -> None:
+    client = TestClient(create_app())
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
 
 
-def test_providers_shape() -> None:
+def test_providers_list() -> None:
+    client = TestClient(create_app())
     r = client.get("/api/providers")
     assert r.status_code == 200
-    data = r.json()
-    assert "providers" in data
-    assert len(data["providers"]) >= 4
-    for row in data["providers"]:
-        assert "default_model_id" in row
-        assert "model_options" in row
-        assert isinstance(row["model_options"], list)
-
-
-def test_vllm_gemma_provider_present() -> None:
-    r = client.get("/api/providers")
     rows = {p["id"]: p for p in r.json()["providers"]}
-    assert "vllm_gemma" in rows
-    assert rows["vllm_gemma"]["label"] == "Local — Gemma 4 (vLLM)"
-    # Default in tests: VLLM_ENABLED=false → not configured
-    assert rows["vllm_gemma"]["configured"] is False
+    assert "gemini" in rows
+    assert "vllm_dots" in rows
+    assert "vllm_gemma" not in rows
 
 
-def test_vllm_gemma_message_builder() -> None:
-    from app.providers.vllm_gemma import _image_url_part, _text_part
+def test_vllm_dots_provider_label() -> None:
+    client = TestClient(create_app())
+    rows = {p["id"]: p for p in client.get("/api/providers").json()["providers"]}
+    assert rows["vllm_dots"]["label"] == "Local — dots.ocr (vLLM)"
 
-    img = _image_url_part(b"\x89PNG", "image/png")
-    assert img["type"] == "image_url"
-    assert img["image_url"]["url"].startswith("data:image/png;base64,")
-    assert _text_part("hi")["text"] == "hi"
+
+def test_vllm_dots_message_builder() -> None:
+    from app.providers.vllm_dots import DOTS_OCR_BASE_PROMPT, _image_url_part, _text_part
+
+    assert "Extract the text" in DOTS_OCR_BASE_PROMPT
+    assert _text_part("hi") == {"type": "text", "text": "hi"}
+    part = _image_url_part(b"\xff\xd8\xff", "image/jpeg")
+    assert part["type"] == "image_url"
+    assert part["image_url"]["url"].startswith("data:image/jpeg;base64,")

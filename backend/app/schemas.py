@@ -10,7 +10,7 @@ class OcrProvider(str, Enum):
     gemini = "gemini"
     bedrock_claude = "bedrock_claude"
     bedrock_ocr = "bedrock_ocr"
-    vllm_gemma = "vllm_gemma"
+    vllm_dots = "vllm_dots"
 
 
 class VllmState(str, Enum):
@@ -58,6 +58,7 @@ class OcrSavedResult(BaseModel):
     completed_at: str | None = None
     elapsed_seconds: float | None = None
     pages: list[OcrPageResult] = Field(default_factory=list)
+    combined_text: str = ""
 
 
 class RecentJobSummary(BaseModel):
