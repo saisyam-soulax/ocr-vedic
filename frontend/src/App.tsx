@@ -307,24 +307,27 @@ export default function App() {
       .then((r) => (r.ok ? r.json() : null))
       .then((body: { jobs?: ServerJob[] } | null) => {
         if (!body?.jobs?.length) return
-        // Only care about genuinely incomplete server jobs (partial results on disk).
-        const incomplete = body.jobs.filter((j) => !j.done && j.done_count > 0)
-        if (!incomplete.length) return
+        // Merge ALL server jobs that have any data (complete or partial).
+        // This ensures Recent Jobs shows up for users with no localStorage entries
+        // (different browser, cleared storage, or pre-checkpoint runs).
+        const relevant = body.jobs.filter((j) => j.done || j.done_count > 0)
+        if (!relevant.length) return
         setSavedJobs((prev) => {
           const existingIds = new Set(prev.map((j) => j.job_id))
-          const toAdd: SavedJob[] = incomplete
+          const toAdd: SavedJob[] = relevant
             .filter((j) => !existingIds.has(j.job_id))
             .map((j) => ({
               job_id: j.job_id,
               ts: j.submitted_at ? new Date(j.submitted_at).getTime() : Date.now(),
               filename: j.files[0] ?? 'unknown',
               pages: j.done_count,
-              // total may equal done_count if job_complete.json was never written
-              // (process was killed). We flag this with totalPages=0 so the badge
-              // shows "Xp saved" instead of the misleading "X/Xp — incomplete".
-              totalPages: j.total > j.done_count ? j.total : 0,
+              // For incomplete jobs: total may equal done_count if job_complete.json
+              // was never written (process was killed). Flag with totalPages=0 so
+              // the badge shows "Xp saved" instead of the misleading "X/Xp — incomplete".
+              // For complete jobs: totalPages = total (same as pages).
+              totalPages: j.done ? j.total : (j.total > j.done_count ? j.total : 0),
               provider: j.provider ?? 'unknown',
-              isComplete: false,
+              isComplete: j.done,
             }))
           if (!toAdd.length) return prev
           const merged = [...toAdd, ...prev].slice(0, MAX_SAVED)
