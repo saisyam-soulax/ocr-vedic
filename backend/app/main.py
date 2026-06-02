@@ -277,6 +277,10 @@ def create_app() -> FastAPI:
             File(description="Images for few-shots; same order as few_shots"),
         ] = None,
         model_id: str | None = Form(None),
+        resume_job_id: str | None = Form(
+            None,
+            description="Job ID of a previous partial run to resume from.",
+        ),
         s: Settings = Depends(get_settings),
     ) -> OcrJobResponse:
         _prune_stale_jobs()
@@ -346,6 +350,24 @@ def create_app() -> FastAPI:
 
         effective_user_prompt = (user_prompt or system_prompt or "").strip() or None
 
+        # ── Resume: load already-completed pages from a prior partial run ────
+        preloaded_pages: list[dict] = []
+        if resume_job_id and _UUID_RE.match(resume_job_id):
+            prev_dir = s.upload_root_path() / resume_job_id
+            prev_results = prev_dir / "results.jsonl"
+            if prev_results.is_file():
+                for raw_line in prev_results.read_text(encoding="utf-8").splitlines():
+                    raw_line = raw_line.strip()
+                    if raw_line:
+                        try:
+                            preloaded_pages.append(json.loads(raw_line))
+                        except json.JSONDecodeError:
+                            pass
+            logger.info(
+                "Resume from %s: loaded %d preloaded pages",
+                resume_job_id, len(preloaded_pages),
+            )
+
         # Create job queue and start background processing.
         q: asyncio.Queue = asyncio.Queue()
         task = asyncio.create_task(
@@ -359,6 +381,7 @@ def create_app() -> FastAPI:
                 model_id=model_id_clean,
                 batch_dir=batch_dir,
                 retain=s.upload_retain,
+                preloaded_pages=preloaded_pages or None,
             )
         )
         job_id = batch_id

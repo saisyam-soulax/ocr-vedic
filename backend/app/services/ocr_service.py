@@ -394,6 +394,7 @@ async def run_ocr_job(
     model_id: str | None,
     batch_dir: Path,
     retain: bool,
+    preloaded_pages: list[dict] | None = None,
 ) -> None:
     """Process all pages concurrently and push events to *queue*.
 
@@ -432,6 +433,7 @@ async def run_ocr_job(
             model_id=model_id,
             batch_dir=batch_dir,
             gemini_cost_session=gemini_cost_session,
+            preloaded_pages=preloaded_pages,
         )
     except Exception as exc:
         logger.exception("Fatal error in OCR job")
@@ -558,6 +560,7 @@ async def _run(
     model_id: str | None,
     batch_dir: Path,
     gemini_cost_session: object | None = None,
+    preloaded_pages: list[dict] | None = None,
 ) -> int:
     """Returns total page count."""
     loop = asyncio.get_running_loop()
@@ -604,9 +607,34 @@ async def _run(
     logger.info("OCR job: provider=%s pages=%d concurrency=%d", provider, total, concurrency)
     await queue.put({"event": "start", "total": total})
 
+    # ── Resume support: re-emit already-completed pages and skip them below ────
+    # preloaded_pages comes from a previous partial run's results.jsonl.
+    # Validate indices against current total so stale/mismatched data is ignored.
+    preloaded: dict[int, dict] = {}
+    if preloaded_pages:
+        for p in preloaded_pages:
+            idx = p.get("index")
+            if isinstance(idx, int) and 0 <= idx < total:
+                preloaded[idx] = p
+    done_count = 0
+
+    if preloaded:
+        logger.info("Resume: re-emitting %d preloaded pages (skipping re-OCR)", len(preloaded))
+        for idx in sorted(preloaded.keys()):
+            page_dict = preloaded[idx]
+            done_count += 1
+            line = json.dumps(page_dict) + "\n"
+            async with results_lock:
+                await loop.run_in_executor(None, _append_result_line, results_path, line)
+            await queue.put({
+                "event": "page",
+                "data": page_dict,
+                "done": done_count,
+                "total": total,
+            })
+
     # Phase 2: rasterize (per PDF page) and transcribe concurrently.
     semaphore = asyncio.Semaphore(concurrency)
-    done_count = 0
 
     async def process_one(
         idx: int, name: str, kind: str, payload: object, page_in_src: int | None
@@ -677,6 +705,7 @@ async def _run(
     tasks = [
         asyncio.create_task(process_one(idx, name, kind, payload, pg))
         for idx, name, kind, payload, pg in page_slots
+        if idx not in preloaded  # skip pages already loaded from a previous run
     ]
 
     for fut in asyncio.as_completed(tasks):

@@ -695,3 +695,49 @@ select {
   transition: width 0.4s ease;
   min-width: 4px;
 }
+
+/* ---- Warn badge (incomplete jobs) ---- */
+.badge--warn {
+  border-color: #d97706;
+  color: #d97706;
+  background: rgba(217, 119, 6, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  .badge--warn {
+    border-color: #fbbf24;
+    color: #fbbf24;
+    background: rgba(251, 191, 36, 0.10);
+  }
+}
+
+/* ---- Resume banner ---- */
+.resume-banner {
+  margin-top: var(--space-md);
+  padding: var(--space-sm) var(--space-md);
+  border: 1px solid #d97706;
+  border-radius: var(--radius-md);
+  background: rgba(217, 119, 6, 0.07);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+}
+
+.resume-banner--active {
+  border-color: var(--success);
+  background: var(--success-bg);
+}
+
+.resume-banner__text {
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  .resume-banner {
+    border-color: #fbbf24;
+    background: rgba(251, 191, 36, 0.07);
+  }
+}

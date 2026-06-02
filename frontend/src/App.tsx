@@ -43,10 +43,12 @@ type VllmStatus = {
 
 type SavedJob = {
   job_id: string
-  ts: number       // epoch ms
-  filename: string // first source filename
-  pages: number
+  ts: number        // epoch ms
+  filename: string  // first source filename
+  pages: number     // pages completed so far
+  totalPages: number // expected total (0 = unknown)
   provider: string
+  isComplete: boolean // true when the SSE 'done' event fired
 }
 
 // ─── localStorage helpers ─────────────────────────────────────────────────────
@@ -56,7 +58,17 @@ const MAX_SAVED = 20
 
 function loadSavedJobs(): SavedJob[] {
   try {
-    return JSON.parse(localStorage.getItem(SAVED_JOBS_KEY) ?? '[]') as SavedJob[]
+    const raw = JSON.parse(localStorage.getItem(SAVED_JOBS_KEY) ?? '[]') as Array<Record<string, unknown>>
+    // Migrate old entries that predate totalPages / isComplete fields.
+    return raw.map((j) => ({
+      job_id: String(j.job_id ?? ''),
+      ts: Number(j.ts ?? 0),
+      filename: String(j.filename ?? ''),
+      pages: Number(j.pages ?? 0),
+      totalPages: Number(j.totalPages ?? j.pages ?? 0),
+      provider: String(j.provider ?? ''),
+      isComplete: j.isComplete !== undefined ? Boolean(j.isComplete) : true,
+    }))
   } catch {
     return []
   }
@@ -267,6 +279,12 @@ export default function App() {
   const [vllmStatus, setVllmStatus] = useState<VllmStatus | null>(null)
   const [vllmBusy, setVllmBusy] = useState(false)
 
+  // ── Resume / checkpoint ────────────────────────────────────────────────────
+  // Candidate: an incomplete saved job that matches the currently-selected file.
+  const [resumeCandidate, setResumeCandidate] = useState<SavedJob | null>(null)
+  // Set to the job_id the user confirmed to resume from (null = start fresh).
+  const [resumeJobId, setResumeJobId] = useState<string | null>(null)
+
   // ── Keep providerRef in sync ───────────────────────────────────────────────
   useEffect(() => {
     providerRef.current = provider
@@ -308,6 +326,20 @@ export default function App() {
       clearInterval(id)
     }
   }, [provider])
+
+  // ── Detect a resumable checkpoint when the file selection changes ──────────
+  useEffect(() => {
+    if (!mainFiles.length) {
+      setResumeCandidate(null)
+      return
+    }
+    const firstName = mainFiles[0].name
+    // A job is resumable if: filename matches, not yet complete, and at least 1 page saved.
+    const candidate = savedJobs.find(
+      (j) => j.filename === firstName && !j.isComplete && j.pages > 0,
+    )
+    setResumeCandidate(candidate ?? null)
+  }, [mainFiles, savedJobs])
 
   // ── vLLM actions ───────────────────────────────────────────────────────────
   const vllmLoad = useCallback(async () => {
@@ -513,6 +545,10 @@ export default function App() {
       }
     }
     if (userPrompt.trim()) fd.append('user_prompt', userPrompt.trim())
+    if (resumeJobId) fd.append('resume_job_id', resumeJobId)
+    // Clear resume state — the new job takes over from here.
+    setResumeJobId(null)
+    setResumeCandidate(null)
     fd.append(
       'few_shots',
       JSON.stringify(
@@ -568,6 +604,18 @@ export default function App() {
         setPages([])
         setServerCombinedText(null)
         setPagesTotal(d.total)
+        // Create initial checkpoint so this job is resumable if the connection drops.
+        setSavedJobs(
+          upsertSavedJob({
+            job_id: jobId,
+            ts: Date.now(),
+            filename: firstFilename,
+            pages: 0,
+            totalPages: d.total,
+            provider: submittedProvider,
+            isComplete: false,
+          }),
+        )
       } catch { /* ignore parse errors */ }
     })
 
@@ -590,6 +638,18 @@ export default function App() {
         })
         setPagesDone(d.done)
         setPagesTotal(d.total)
+        // Keep the checkpoint up to date so resuming skips exactly the right pages.
+        setSavedJobs(
+          upsertSavedJob({
+            job_id: jobId,
+            ts: Date.now(),
+            filename: firstFilename,
+            pages: d.done,
+            totalPages: d.total,
+            provider: submittedProvider,
+            isComplete: false,
+          }),
+        )
       } catch { /* ignore */ }
     })
 
@@ -625,50 +685,91 @@ export default function App() {
         })
         .catch(() => {})
 
-      // Persist job to localStorage
+      // Mark job complete in localStorage (clears resume eligibility).
       setSavedJobs(
         upsertSavedJob({
           job_id: jobId,
           ts: Date.now(),
           filename: firstFilename,
           pages: finalTotal,
+          totalPages: finalTotal,
           provider: submittedProvider,
+          isComplete: true,
         }),
       )
     })
 
     es.onerror = () => {
-      // After 'done', the server closes the connection — browser fires onerror.
-      // That's normal; ignore it if we already handled 'done'.
-      if (isDone || es.readyState === EventSource.CLOSED) return
-      es.close()
-      esRef.current = null
-      setLoading(false)
+      // After 'done' the server closes the connection and the browser fires onerror.
+      // That's normal — ignore it.
+      if (isDone) return
 
-      // Job may still be running server-side; poll saved results.
+      if (es.readyState === EventSource.CLOSED) {
+        // Permanent failure (e.g. job expired, 404 from server).
+        // Fetch whatever was saved and surface it.
+        setLoading(false)
+        void pollJobResult(jobId).then((body) => {
+          if (!body) return
+          applyJobResult(body)
+          if (body.done) {
+            setStreamDone(true)
+          } else if ((body.pages?.length ?? 0) > 0) {
+            setError('Stream closed unexpectedly. Showing partial saved results — use Resume to continue.')
+          } else {
+            setError('Stream closed unexpectedly and no saved results were found.')
+          }
+        })
+        return
+      }
+
+      // readyState === CONNECTING — browser is auto-reconnecting.
+      // Keep loading=true so the Cancel button and progress strip stay visible.
+      // Show a non-fatal status and poll the server to fill in any pages we missed
+      // while the connection was down. When the stream reconnects, new page events
+      // will arrive normally; the isDone flag will let the polling loop exit cleanly.
+      setError('Connection interrupted — reconnecting…')
+
       void (async () => {
-        for (let i = 0; i < 120; i++) {
-          await new Promise((r) => window.setTimeout(r, 3000))
+        for (let i = 0; i < 40; i++) {
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 3000))
+          if (isDone) { setError(null); return }
+          if (es.readyState === EventSource.CLOSED) break // escalate to permanent failure
+
           const body = await pollJobResult(jobId)
           if (!body) continue
+
+          // Fill any gaps (pages sent before disconnect that we didn't receive).
           applyJobResult(body)
-          if (body.done || (body.pages?.length ?? 0) > 0) {
-            if (body.done) {
-              setStreamDone(true)
-              setError((prev) =>
-                prev
-                  ? prev
-                  : 'Live stream ended; showing saved results from the server.',
-              )
-            }
-            if (body.done) return
+          if ((body.pages?.length ?? 0) > 0) setError(null) // progress is happening
+
+          if (body.done) {
+            isDone = true
+            setStreamDone(true)
+            setLoading(false)
+            setError(null)
+            setSavedJobs(
+              upsertSavedJob({
+                job_id: jobId,
+                ts: Date.now(),
+                filename: firstFilename,
+                pages: body.pages?.length ?? 0,
+                totalPages: body.pages?.length ?? 0,
+                provider: submittedProvider,
+                isComplete: true,
+              }),
+            )
+            es.close()
+            esRef.current = null
+            return
           }
         }
-        setError((prev) =>
-          prev
-            ? prev
-            : 'Stream connection lost. Check Recent jobs or retry — the server may still be processing.',
+        // Polling timed out without the job finishing.
+        setLoading(false)
+        setError(
+          'Lost connection. The server may still be processing — check Recent jobs or use Resume to continue from the last saved page.',
         )
+        es.close()
+        esRef.current = null
       })()
     }
   }
@@ -963,6 +1064,54 @@ export default function App() {
                   </li>
                 ))}
               </ul>
+
+              {/* ── Resume banner (shown when an incomplete checkpoint is found) ── */}
+              {resumeCandidate && (
+                <div className="resume-banner">
+                  <div className="resume-banner__text">
+                    <strong>Incomplete run found</strong> —{' '}
+                    {resumeCandidate.pages} of {resumeCandidate.totalPages} pages saved
+                    for <em>{resumeCandidate.filename}</em>. Resume from where it stopped?
+                  </div>
+                  <div className="toolbar">
+                    <button
+                      type="button"
+                      className="btn btn--primary btn--sm"
+                      onClick={() => {
+                        setResumeJobId(resumeCandidate.job_id)
+                        setResumeCandidate(null)
+                      }}
+                    >
+                      Resume
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn--sm"
+                      onClick={() => {
+                        setResumeJobId(null)
+                        setResumeCandidate(null)
+                      }}
+                    >
+                      Start fresh
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {resumeJobId && !resumeCandidate && (
+                <div className="resume-banner resume-banner--active">
+                  <span className="resume-banner__text">
+                    ✓ Will resume from checkpoint — Run OCR to continue.
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn--sm"
+                    onClick={() => setResumeJobId(null)}
+                  >
+                    Cancel resume
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </section>
@@ -1233,8 +1382,15 @@ export default function App() {
                     <div className="file-row__name" title={job.job_id}>
                       {job.filename}
                     </div>
-                    <span className="badge" style={{ marginTop: 6 }}>
-                      {new Date(job.ts).toLocaleDateString()} · {job.pages}p · {job.provider}
+                    <span
+                      className={`badge${job.isComplete ? '' : ' badge--warn'}`}
+                      style={{ marginTop: 6 }}
+                    >
+                      {new Date(job.ts).toLocaleDateString()} ·{' '}
+                      {job.isComplete
+                        ? `${job.pages}p`
+                        : `${job.pages}/${job.totalPages}p — incomplete`}{' '}
+                      · {job.provider}
                     </span>
                   </div>
                   <div className="toolbar">
