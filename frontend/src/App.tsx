@@ -290,6 +290,51 @@ export default function App() {
     providerRef.current = provider
   }, [provider])
 
+  // ── On mount: pull server-side incomplete jobs and merge into savedJobs ──────
+  // This surfaces runs that broke mid-way before the checkpoint code existed —
+  // they have no localStorage entry but results.jsonl on disk with partial data.
+  useEffect(() => {
+    type ServerJob = {
+      job_id: string
+      files: string[]
+      provider: string | null
+      done: boolean
+      total: number
+      done_count: number
+      submitted_at: string | null
+    }
+    fetch(apiUrl('ocr/jobs'))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body: { jobs?: ServerJob[] } | null) => {
+        if (!body?.jobs?.length) return
+        // Only care about genuinely incomplete server jobs (partial results on disk).
+        const incomplete = body.jobs.filter((j) => !j.done && j.done_count > 0)
+        if (!incomplete.length) return
+        setSavedJobs((prev) => {
+          const existingIds = new Set(prev.map((j) => j.job_id))
+          const toAdd: SavedJob[] = incomplete
+            .filter((j) => !existingIds.has(j.job_id))
+            .map((j) => ({
+              job_id: j.job_id,
+              ts: j.submitted_at ? new Date(j.submitted_at).getTime() : Date.now(),
+              filename: j.files[0] ?? 'unknown',
+              pages: j.done_count,
+              // total may equal done_count if job_complete.json was never written
+              // (process was killed). We flag this with totalPages=0 so the badge
+              // shows "Xp saved" instead of the misleading "X/Xp — incomplete".
+              totalPages: j.total > j.done_count ? j.total : 0,
+              provider: j.provider ?? 'unknown',
+              isComplete: false,
+            }))
+          if (!toAdd.length) return prev
+          const merged = [...toAdd, ...prev].slice(0, MAX_SAVED)
+          localStorage.setItem(SAVED_JOBS_KEY, JSON.stringify(merged))
+          return merged
+        })
+      })
+      .catch(() => {})
+  }, [])
+
   // ── Fetch provider list ────────────────────────────────────────────────────
   useEffect(() => {
     fetch(apiUrl('providers'))
@@ -1392,7 +1437,9 @@ export default function App() {
                       {new Date(job.ts).toLocaleDateString()} ·{' '}
                       {job.isComplete
                         ? `${job.pages}p`
-                        : `${job.pages}/${job.totalPages}p — incomplete`}{' '}
+                        : job.totalPages > 0
+                          ? `${job.pages}/${job.totalPages}p — incomplete`
+                          : `${job.pages}p saved — incomplete`}{' '}
                       · {job.provider}
                     </span>
                   </div>
