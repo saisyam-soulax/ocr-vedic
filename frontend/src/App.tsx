@@ -1101,7 +1101,10 @@ export default function App() {
               {resumeJobId && !resumeCandidate && (
                 <div className="resume-banner resume-banner--active">
                   <span className="resume-banner__text">
-                    ✓ Will resume from checkpoint — Run OCR to continue.
+                    ✓ Checkpoint loaded —{' '}
+                    {mainFiles.length === 0
+                      ? 'Upload the original PDF/images above, then click Run OCR.'
+                      : 'Ready. Click Run OCR to continue from where it stopped.'}
                   </span>
                   <button
                     type="button"
@@ -1394,13 +1397,29 @@ export default function App() {
                     </span>
                   </div>
                   <div className="toolbar">
-                    <button
-                      type="button"
-                      className="btn btn--sm"
-                      onClick={() => void restoreJob(job.job_id)}
-                    >
-                      Restore
-                    </button>
+                    {/* Incomplete jobs get a Resume button; complete jobs get Restore. */}
+                    {!job.isComplete ? (
+                      <button
+                        type="button"
+                        className="btn btn--primary btn--sm"
+                        onClick={() => {
+                          setResumeJobId(job.job_id)
+                          setResumeCandidate(null)
+                          // Scroll to the top so the user sees the upload zone + confirmation banner.
+                          window.scrollTo({ top: 0, behavior: 'smooth' })
+                        }}
+                      >
+                        Resume
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="btn btn--sm"
+                        onClick={() => void restoreJob(job.job_id)}
+                      >
+                        Restore
+                      </button>
+                    )}
                     <a
                       className="btn btn--sm"
                       href={apiUrl(`ocr/${job.job_id}/download.txt`)}
