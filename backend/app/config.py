@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.utils.gemini_api_key import resolve_rotating_gemini_api_key
 
 
 def _default_upload_storage_dir() -> str:
@@ -50,6 +53,30 @@ class Settings(BaseSettings):
 
     # Google Gemini
     google_api_key: str | None = None
+    google_api_key_sampath: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "GOOGLE_API_KEY-Sampath",
+            "GOOGLE_API_KEY_SAMPATH",
+            "google_api_key_sampath",
+        ),
+    )
+    google_api_key_rishi: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "GOOGLE_API_KEY-Rishi",
+            "GOOGLE_API_KEY_RISHI",
+            "google_api_key_rishi",
+        ),
+    )
+    google_api_key_syam: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "GOOGLE_API_KEY-Syam",
+            "GOOGLE_API_KEY_SYAM",
+            "google_api_key_syam",
+        ),
+    )
     gemini_model: str = Field(
         default="gemini-2.0-flash",
         validation_alias=AliasChoices("GEMINI_MODEL", "gemini_model"),
@@ -239,6 +266,33 @@ class Settings(BaseSettings):
 
     def gemini_cost_ledger_path(self) -> Path:
         return (Path(self.gemini_cost_ledger_dir).expanduser().resolve() / "ledger.jsonl")
+
+    def effective_google_api_key(
+        self, *, now: datetime | None = None
+    ) -> tuple[str | None, str]:
+        """Active Gemini key and slot label (IST rotation with Sampath fallback)."""
+        return resolve_rotating_gemini_api_key(
+            sampath=self.google_api_key_sampath,
+            rishi=self.google_api_key_rishi,
+            syam=self.google_api_key_syam,
+            legacy=self.google_api_key,
+            now=now,
+        )
+
+    def all_google_api_keys(self) -> list[tuple[str, str]]:
+        """All configured Gemini keys as ``[(api_key, slot_name), ...]`` for round-robin pool.
+
+        Unlike ``effective_google_api_key`` (which picks one key by IST time), this
+        returns every non-empty key so the caller can distribute pages across them and
+        rotate to the next key on 429 RESOURCE_EXHAUSTED.
+        """
+        from app.utils.gemini_api_key import all_configured_keys
+        return all_configured_keys(
+            sampath=self.google_api_key_sampath,
+            rishi=self.google_api_key_rishi,
+            syam=self.google_api_key_syam,
+            legacy=self.google_api_key,
+        )
 
     def gemini_models_for_providers(self) -> tuple[str | None, list[str]]:
         default = self.gemini_model

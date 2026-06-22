@@ -69,6 +69,8 @@ def transcribe_with_provider(
     gemini_cost_page_index: int | None = None,
     gemini_cost_page_in_source: int | None = None,
     gemini_cost_source_file: str | None = None,
+    gemini_api_key_override: str | None = None,
+    gemini_api_key_slot: str | None = None,
 ) -> str:
     """Synchronous dispatch — used directly or via run_in_executor."""
     from app.providers.bedrock_claude import BedrockClaudeProvider
@@ -91,6 +93,8 @@ def transcribe_with_provider(
             settings=settings,
             timeout_seconds=timeout,
             model_id=model_id,
+            api_key=gemini_api_key_override,
+            api_key_slot=gemini_api_key_slot,
             cost_session=gemini_cost_session,
             cost_page_index=gemini_cost_page_index,
             cost_page_in_source=gemini_cost_page_in_source,
@@ -128,6 +132,8 @@ async def transcribe_with_provider_async(
     gemini_cost_page_index: int | None = None,
     gemini_cost_page_in_source: int | None = None,
     gemini_cost_source_file: str | None = None,
+    gemini_api_key_override: str | None = None,
+    gemini_api_key_slot: str | None = None,
 ) -> str:
     """Async dispatch.
 
@@ -172,6 +178,8 @@ async def transcribe_with_provider_async(
         gemini_cost_page_index=gemini_cost_page_index,
         gemini_cost_page_in_source=gemini_cost_page_in_source,
         gemini_cost_source_file=gemini_cost_source_file,
+        gemini_api_key_override=gemini_api_key_override,
+        gemini_api_key_slot=gemini_api_key_slot,
     )
     return await loop.run_in_executor(None, fn)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from google import genai
@@ -14,6 +15,87 @@ if TYPE_CHECKING:
     from app.cost.gemini_ledger import GeminiCostSession
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Rate-limit helpers (used by ocr_service for smart retry/key rotation)
+# ---------------------------------------------------------------------------
+
+_RATE_LIMIT_PHRASES = frozenset([
+    "resource_exhausted", "resource exhausted", "quota exceeded",
+    "rateerror", "rate_limit_error",
+])
+_RETRY_AFTER_RE = re.compile(r"retry in (\d+(?:\.\d+)?)\s*s", re.IGNORECASE)
+# "limit: 0" in the error body means the free-tier limit is literally zero for this
+# model — not that you exhausted your quota. No amount of waiting or key rotation will
+# fix it; the model requires billing or a different account tier.
+_HARD_ZERO_LIMIT_RE = re.compile(r'"limit"\s*:\s*0|limit:\s*0', re.IGNORECASE)
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    """Return True if *exc* is a Gemini 429 / RESOURCE_EXHAUSTED error."""
+    msg = str(exc).lower()
+    if any(p in msg for p in _RATE_LIMIT_PHRASES):
+        return True
+    if "429" in str(exc):
+        return True
+    if hasattr(exc, "code") and getattr(exc, "code", None) == 429:
+        return True
+    if hasattr(exc, "status_code") and getattr(exc, "status_code", None) == 429:
+        return True
+    return False
+
+
+def is_invalid_key_error(exc: Exception) -> bool:
+    """Return True if *exc* indicates the API key itself is rejected (400/401/403).
+
+    These are key-specific failures — retrying with the same key will never help.
+    The caller should rotate to the next key immediately.
+    """
+    msg = str(exc).lower()
+    key_phrases = ("api key not found", "api_key_invalid", "invalid api key",
+                   "permission_denied", "unauthenticated")
+    if any(p in msg for p in key_phrases):
+        return True
+    raw = str(exc)
+    for code in ("400", "401", "403"):
+        if raw.startswith(code + " "):
+            return True
+    if hasattr(exc, "code") and getattr(exc, "code", None) in (400, 401, 403):
+        return True
+    if hasattr(exc, "status_code") and getattr(exc, "status_code", None) in (400, 401, 403):
+        return True
+    return False
+
+
+def is_service_disabled_error(exc: Exception) -> bool:
+    """Return True when the GCP Agent Platform API itself is disabled for the project,
+    or when billing is not enabled (both are project-level blocks that key rotation
+    cannot fix).
+    """
+    msg = str(exc).lower()
+    return (
+        "service_disabled" in msg
+        or "api has not been used" in msg
+        or "billing_disabled" in msg
+        or "requires billing to be enabled" in msg
+    )
+
+
+def is_hard_quota_zero(exc: Exception) -> bool:
+    """Return True when the quota *limit* itself is 0 (not just temporarily exhausted).
+
+    ``limit: 0`` in the error JSON means the model has no free-tier access at all.
+    Retrying — even with a different API key — will not help; the user needs to
+    enable billing or switch to a model that has free-tier quota (e.g. gemini-2.5-flash,
+    gemini-2.0-flash).
+    """
+    return bool(_HARD_ZERO_LIMIT_RE.search(str(exc)))
+
+
+def parse_retry_after(exc: Exception, default: float = 60.0) -> float:
+    """Extract the 'retry in Xs' hint from a Gemini rate-limit response, or *default*."""
+    m = _RETRY_AFTER_RE.search(str(exc))
+    return float(m.group(1)) if m else default
 
 
 def _usage_from_response(response: object) -> dict[str, int]:
@@ -46,20 +128,30 @@ class GeminiProvider(OcrProviderBase):
         settings: Settings,
         timeout_seconds: int,
         model_id: str | None = None,
+        api_key: str | None = None,
+        api_key_slot: str | None = None,
         cost_session: GeminiCostSession | None = None,
         cost_page_index: int | None = None,
         cost_page_in_source: int | None = None,
         cost_source_file: str | None = None,
         cost_step: str = "ocr",
     ) -> None:
+        # api_key may be supplied directly (round-robin pool) or resolved from settings.
+        if api_key is None:
+            api_key, key_slot = settings.effective_google_api_key()
+        else:
+            key_slot = api_key_slot or "explicit"
+        if api_key:
+            logger.info("Gemini API key slot: %s", key_slot)
+
         if settings.gemini_use_vertexai:
             # Vertex AI accepts EITHER an Agentic Platform / Express API key OR
             # project + ADC, but not both — the SDK rejects mixing them. Pick the
             # mode that matches what the user supplied.
-            if settings.google_api_key:
+            if api_key:
                 self._client = genai.Client(
                     vertexai=True,
-                    api_key=settings.google_api_key,
+                    api_key=api_key,
                 )
             elif settings.google_cloud_project and settings.google_cloud_location:
                 self._client = genai.Client(
@@ -75,8 +167,8 @@ class GeminiProvider(OcrProviderBase):
                     "and GOOGLE_CLOUD_LOCATION and authenticate with ADC "
                     "(`gcloud auth application-default login`)."
                 )
-        elif settings.google_api_key:
-            self._client = genai.Client(api_key=settings.google_api_key)
+        elif api_key:
+            self._client = genai.Client(api_key=api_key)
         else:
             # Fall back to env vars (GOOGLE_API_KEY / GEMINI_API_KEY) or ADC.
             self._client = genai.Client()

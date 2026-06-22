@@ -21,6 +21,13 @@ from fastapi import HTTPException, UploadFile
 from app.config import Settings, get_settings
 from app.cost.gemini_ledger import finalize_gemini_job_costs, start_gemini_cost_session
 from app.providers.base import transcribe_with_provider, transcribe_with_provider_async
+from app.providers.gemini import (
+    is_hard_quota_zero,
+    is_invalid_key_error,
+    is_rate_limit_error,
+    is_service_disabled_error,
+    parse_retry_after,
+)
 from app.schemas import OcrPageResult, OcrProvider
 from app.storage_uploads import sniff_is_pdf
 from app.utils.image_preprocess import preprocess_image_bytes
@@ -475,10 +482,17 @@ async def run_ocr_job(
             elapsed_seconds=elapsed,
         )
 
+        gemini_cost_payload = None
+        if gemini_cost_session and gemini_cost_session.calls:
+            gemini_cost_payload = gemini_cost_session.build_job_log(
+                elapsed_seconds=elapsed,
+            )["summary"]
+
         await queue.put({
             "event": "done",
             "total": total,
             "elapsed_seconds": elapsed,
+            "gemini_cost": gemini_cost_payload,
         })
         await queue.put(None)  # sentinel — tells the SSE generator to close
 
@@ -604,6 +618,23 @@ async def _run(
     if provider == OcrProvider.vllm_dots.value:
         concurrency = 1
 
+    # ── Gemini key pool for round-robin distribution + 429 rotation ────────────
+    # Build the full list of configured Gemini keys once per job.  Pages are
+    # assigned to keys round-robin (page_idx % n_keys) so no single key is
+    # hammered while the others stay idle.  When a key returns 429/RESOURCE_EXHAUSTED,
+    # the retry logic below immediately rotates to the next key in the pool.
+    gemini_key_pool: list[tuple[str, str]] = []  # [(api_key, slot_name), …]
+    if provider == OcrProvider.gemini.value:
+        gemini_key_pool = settings.all_google_api_keys()
+        if gemini_key_pool:
+            logger.info(
+                "Gemini key pool: %d key(s) — %s",
+                len(gemini_key_pool),
+                [slot for _, slot in gemini_key_pool],
+            )
+        else:
+            logger.warning("Gemini key pool is empty — falling back to env/ADC auth")
+
     logger.info("OCR job: provider=%s pages=%d concurrency=%d", provider, total, concurrency)
     await queue.put({"event": "start", "total": total})
 
@@ -665,9 +696,19 @@ async def _run(
                 ),
             )
 
+        # Round-robin: assign the initial key for this page by its index.
+        n_keys = len(gemini_key_pool)
+        key_idx = idx % max(n_keys, 1)
+
         last_exc: Exception = RuntimeError("no attempts made")
         max_attempts = settings.ocr_page_max_retries + 1
         for attempt in range(max_attempts):
+            # Resolve which Gemini key to use for this attempt.
+            if gemini_key_pool:
+                api_key_override, key_slot = gemini_key_pool[key_idx]
+            else:
+                api_key_override, key_slot = None, None
+
             try:
                 async with semaphore:
                     text = await transcribe_with_provider_async(
@@ -683,6 +724,8 @@ async def _run(
                         gemini_cost_page_index=idx,
                         gemini_cost_page_in_source=page_in_src,
                         gemini_cost_source_file=name,
+                        gemini_api_key_override=api_key_override,
+                        gemini_api_key_slot=key_slot,
                     )
                 return OcrPageResult(
                     index=idx,
@@ -694,11 +737,60 @@ async def _run(
             except Exception as exc:
                 last_exc = exc
                 if attempt < max_attempts - 1:
-                    delay = 2 ** attempt  # 1 s, 2 s, 4 s …
-                    logger.warning(
-                        "Page %d attempt %d/%d failed (%s) — retrying in %.0fs",
-                        idx, attempt + 1, max_attempts, exc, delay,
+                    # SERVICE_DISABLED means the Vertex AI API isn't enabled in the GCP
+                    # project — all keys share the same project, so rotation is pointless.
+                    # Break immediately so the user sees the clear error message fast.
+                    if (
+                        provider == OcrProvider.gemini.value
+                        and is_service_disabled_error(exc)
+                    ):
+                        break
+                    needs_key_rotation = (
+                        provider == OcrProvider.gemini.value
+                        and (is_rate_limit_error(exc) or is_invalid_key_error(exc))
                     )
+                    if needs_key_rotation:
+                        if is_hard_quota_zero(exc):
+                            logger.warning(
+                                "Page %d: key '%s' reports zero free-tier quota (limit=0) "
+                                "for model '%s'. Rotating to next key.",
+                                idx, key_slot, model_id or "default",
+                            )
+                        # Key-rotation strategy:
+                        # • Non-Sampath key failed → fall back to Sampath (index 0).
+                        # • Sampath itself failed  → rotate to the next key sequentially.
+                        # Switching to a different key needs only a brief pause.
+                        if n_keys > 1:
+                            _SAMPATH_IDX = 0  # Sampath is always first in the pool
+                            if key_idx != _SAMPATH_IDX:
+                                key_idx = _SAMPATH_IDX
+                            else:
+                                key_idx = (key_idx + 1) % n_keys
+                            next_slot = gemini_key_pool[key_idx][1]
+                            reason = "invalid key" if is_invalid_key_error(exc) else "rate limit"
+                            delay = 1.0
+                            logger.warning(
+                                "Page %d %s on key '%s' (attempt %d/%d) — "
+                                "falling back to '%s'",
+                                idx, reason, key_slot, attempt + 1, max_attempts, next_slot,
+                            )
+                        else:
+                            delay = (
+                                min(parse_retry_after(exc, default=60.0), 120.0)
+                                if is_rate_limit_error(exc)
+                                else 2.0 ** attempt
+                            )
+                            logger.warning(
+                                "Page %d key error (single key, attempt %d/%d) — "
+                                "retrying in %.0fs",
+                                idx, attempt + 1, max_attempts, delay,
+                            )
+                    else:
+                        delay = 2.0 ** attempt  # 1 s, 2 s, 4 s …
+                        logger.warning(
+                            "Page %d attempt %d/%d failed (%s) — retrying in %.0fs",
+                            idx, attempt + 1, max_attempts, exc, delay,
+                        )
                     await asyncio.sleep(delay)
         raise last_exc
 
@@ -735,9 +827,55 @@ async def _run(
         except Exception as exc:
             done_count += 1
             logger.warning("Page error (all retries exhausted): %s", exc)
+            # Produce a concise, human-readable message for rate-limit failures
+            # (the raw google.genai error string is hundreds of characters of JSON).
+            if provider == OcrProvider.gemini.value and is_service_disabled_error(exc):
+                raw = str(exc)
+                if "billing" in raw.lower():
+                    detail = (
+                        "Vertex AI requires billing to be enabled on your GCP project. "
+                        "Go to https://console.developers.google.com/billing/enable"
+                        "?project=243470839071 and link a billing account. "
+                        "Alternatively, set GEMINI_USE_VERTEXAI=false in .env "
+                        "to use the AI Studio endpoint instead."
+                    )
+                else:
+                    detail = (
+                        "Vertex AI Agent Platform API is disabled for your GCP project. "
+                        "Go to Google Cloud Console → APIs & Services → Enable APIs, "
+                        "search for 'Vertex AI API', and click Enable. "
+                        "Then wait ~2 minutes and retry."
+                    )
+            elif provider == OcrProvider.gemini.value and is_invalid_key_error(exc):
+                n_pool = len(gemini_key_pool)
+                detail = (
+                    f"All {n_pool} configured Gemini key(s) were rejected "
+                    "(API Key not found / permission denied). "
+                    "If your keys start with 'AQ.' (Vertex AI Express), ensure "
+                    "GEMINI_USE_VERTEXAI=true is set in .env and the "
+                    "Vertex AI API is enabled for your GCP project. "
+                    "If your keys start with 'AIzaSy' (AI Studio), verify they "
+                    "were copied correctly from aistudio.google.com/apikey."
+                )
+            elif is_rate_limit_error(exc) and provider == OcrProvider.gemini.value:
+                if is_hard_quota_zero(exc):
+                    detail = (
+                        f"Model '{model_id or 'default'}' has no free-tier quota "
+                        "(quota limit = 0). Enable billing on your Google account "
+                        "or switch to gemini-2.5-flash / gemini-2.0-flash."
+                    )
+                else:
+                    n_pool = len(gemini_key_pool)
+                    detail = (
+                        f"Gemini quota exhausted on all {n_pool} configured key(s) — "
+                        "daily or per-minute limit reached. "
+                        "Try again later, add more API keys, or switch to a different model."
+                    )
+            else:
+                detail = str(exc)
             await queue.put({
                 "event": "page_error",
-                "detail": str(exc),
+                "detail": detail,
                 "done": done_count,
                 "total": total,
             })

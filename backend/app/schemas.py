@@ -47,6 +47,54 @@ class OcrJobResponse(BaseModel):
     total_files: int
 
 
+class GeminiJobCostSummary(BaseModel):
+    """Estimated Gemini API cost for one OCR job (from usage_metadata + pricing table)."""
+
+    model: str | None = None
+    total_api_calls: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    input_cost_usd: float = 0.0
+    output_cost_usd: float = 0.0
+    estimated_total_cost_usd: float = 0.0
+    pricing_model_key: str | None = None
+    pricing_source: str | None = None
+    pricing_effective: str | None = None
+
+
+class GeminiModelCostBreakdown(BaseModel):
+    model: str
+    job_count: int = 0
+    total_pages: int = 0
+    total_api_calls: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    input_cost_usd: float = 0.0
+    output_cost_usd: float = 0.0
+    estimated_total_cost_usd: float = 0.0
+
+
+class GeminiJobCostEntry(GeminiJobCostSummary):
+    job_id: str
+    submitted_at: str | None = None
+    files: list[str] = Field(default_factory=list)
+
+
+class GeminiCostsOverviewResponse(BaseModel):
+    job_count: int = 0
+    total_pages: int = 0
+    total_api_calls: int = 0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    input_cost_usd: float = 0.0
+    output_cost_usd: float = 0.0
+    estimated_total_cost_usd: float = 0.0
+    pricing_source: str | None = None
+    pricing_effective: str | None = None
+    by_model: list[GeminiModelCostBreakdown] = Field(default_factory=list)
+    jobs: list[GeminiJobCostEntry] = Field(default_factory=list)
+
+
 class OcrSavedResult(BaseModel):
     job_id: str
     done: bool
@@ -59,6 +107,7 @@ class OcrSavedResult(BaseModel):
     elapsed_seconds: float | None = None
     pages: list[OcrPageResult] = Field(default_factory=list)
     combined_text: str = ""
+    gemini_cost: GeminiJobCostSummary | None = None
 
 
 class RecentJobSummary(BaseModel):
@@ -70,6 +119,7 @@ class RecentJobSummary(BaseModel):
     total: int = 0
     done_count: int = 0
     completed_at: str | None = None
+    gemini_cost: GeminiJobCostSummary | None = None
 
 
 class ProviderInfo(BaseModel):

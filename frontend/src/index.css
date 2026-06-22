@@ -195,6 +195,43 @@ a:hover {
   flex-shrink: 0;
 }
 
+.cost-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 14px;
+  margin-top: var(--space-md);
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--accent-muted);
+  font-size: 0.88rem;
+}
+
+.cost-banner__label {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.cost-banner__amount {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.cost-banner__meta {
+  color: var(--text-secondary);
+  font-size: 0.82rem;
+}
+
+.result-meta__tokens {
+  color: var(--text-secondary);
+  font-size: 0.9em;
+}
+
 .card {
   background: var(--surface);
   border: 1px solid var(--border);

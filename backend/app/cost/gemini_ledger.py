@@ -175,3 +175,147 @@ def read_global_ledger(
     # Default: job summaries only for list view
     summaries = [r for r in records if r.get("record_type") == "job_summary"]
     return summaries[-limit:]
+
+
+def cost_summary_from_job_log(data: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a gemini_cost_log.json payload to a compact summary dict."""
+    session = data.get("session_info") or {}
+    summary = data.get("summary") or {}
+    return {
+        "model": session.get("model"),
+        "total_api_calls": int(summary.get("total_api_calls", 0) or 0),
+        "total_input_tokens": int(summary.get("total_input_tokens", 0) or 0),
+        "total_output_tokens": int(summary.get("total_output_tokens", 0) or 0),
+        "input_cost_usd": float(summary.get("input_cost_usd", 0) or 0),
+        "output_cost_usd": float(summary.get("output_cost_usd", 0) or 0),
+        "estimated_total_cost_usd": float(summary.get("estimated_total_cost_usd", 0) or 0),
+        "pricing_model_key": summary.get("pricing_model_key"),
+        "pricing_source": summary.get("pricing_source"),
+        "pricing_effective": summary.get("pricing_effective"),
+    }
+
+
+def read_job_cost_summary(batch_dir: Path) -> dict[str, Any] | None:
+    """Read per-job Gemini cost summary from disk, if present."""
+    cost_path = batch_dir / "gemini_cost_log.json"
+    if not cost_path.is_file():
+        return None
+    try:
+        data = json.loads(cost_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return cost_summary_from_job_log(data)
+
+
+def aggregate_gemini_costs(upload_root: Path) -> dict[str, Any]:
+    """Sum all gemini_cost_log.json files under the uploads directory."""
+    totals = {
+        "job_count": 0,
+        "total_pages": 0,
+        "total_api_calls": 0,
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "input_cost_usd": 0.0,
+        "output_cost_usd": 0.0,
+        "estimated_total_cost_usd": 0.0,
+    }
+    by_model: dict[str, dict[str, Any]] = {}
+    jobs: list[dict[str, Any]] = []
+
+    if not upload_root.is_dir():
+        return {**totals, "by_model": [], "jobs": [], "pricing_source": None, "pricing_effective": None}
+
+    cost_paths = sorted(
+        upload_root.glob("*/gemini_cost_log.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    pricing_source: str | None = None
+    pricing_effective: str | None = None
+
+    for cost_path in cost_paths:
+        try:
+            data = json.loads(cost_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        summary = cost_summary_from_job_log(data)
+        if summary["total_api_calls"] <= 0:
+            continue
+
+        job_id = (data.get("session_info") or {}).get("job_id") or cost_path.parent.name
+        model = summary.get("model") or "unknown"
+        pages = summary["total_api_calls"]
+
+        totals["job_count"] += 1
+        totals["total_pages"] += pages
+        totals["total_api_calls"] += summary["total_api_calls"]
+        totals["total_input_tokens"] += summary["total_input_tokens"]
+        totals["total_output_tokens"] += summary["total_output_tokens"]
+        totals["input_cost_usd"] += summary["input_cost_usd"]
+        totals["output_cost_usd"] += summary["output_cost_usd"]
+        totals["estimated_total_cost_usd"] += summary["estimated_total_cost_usd"]
+
+        if summary.get("pricing_source"):
+            pricing_source = summary["pricing_source"]
+        if summary.get("pricing_effective"):
+            pricing_effective = summary["pricing_effective"]
+
+        bucket = by_model.setdefault(
+            model,
+            {
+                "model": model,
+                "job_count": 0,
+                "total_pages": 0,
+                "total_api_calls": 0,
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "input_cost_usd": 0.0,
+                "output_cost_usd": 0.0,
+                "estimated_total_cost_usd": 0.0,
+            },
+        )
+        bucket["job_count"] += 1
+        bucket["total_pages"] += pages
+        bucket["total_api_calls"] += summary["total_api_calls"]
+        bucket["total_input_tokens"] += summary["total_input_tokens"]
+        bucket["total_output_tokens"] += summary["total_output_tokens"]
+        bucket["input_cost_usd"] += summary["input_cost_usd"]
+        bucket["output_cost_usd"] += summary["output_cost_usd"]
+        bucket["estimated_total_cost_usd"] += summary["estimated_total_cost_usd"]
+
+        submitted_at = None
+        files: list[str] = []
+        meta_path = cost_path.parent / "metadata.json"
+        if meta_path.is_file():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                submitted_at = meta.get("created_at")
+                files = meta.get("files") or []
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        jobs.append(
+            {
+                "job_id": job_id,
+                "model": model,
+                "submitted_at": submitted_at,
+                "files": files,
+                **summary,
+            }
+        )
+
+    by_model_list = sorted(
+        by_model.values(),
+        key=lambda x: x["estimated_total_cost_usd"],
+        reverse=True,
+    )
+    return {
+        **totals,
+        "input_cost_usd": round(totals["input_cost_usd"], 6),
+        "output_cost_usd": round(totals["output_cost_usd"], 6),
+        "estimated_total_cost_usd": round(totals["estimated_total_cost_usd"], 6),
+        "pricing_source": pricing_source,
+        "pricing_effective": pricing_effective,
+        "by_model": by_model_list,
+        "jobs": jobs,
+    }

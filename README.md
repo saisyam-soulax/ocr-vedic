@@ -115,6 +115,10 @@ docker compose --profile vllm up -d --build
 | `UPLOAD_STORAGE_DIR` | OCR batches as `<dir>/<uuid>/` + `metadata.json`. Default: `<backend-root>/data/uploads` (gitignored) |
 | `UPLOAD_RETAIN` | If `true`, keep batch folders after a successful OCR; if `false` (default), delete the batch folder on success |
 | `UPLOAD_RETAIN_HOURS` | When `> 0`, periodically delete batch folders older than this many hours (by directory `mtime`; cleans failed runs too) |
+| `LOG_LEVEL` | Python log level for the backend (`INFO` default; use `DEBUG` for per-page dispatch and provider detail) |
+| `GEMINI_COST_LOG_ENABLED` | `true` (default) records Gemini token usage and USD estimates per OCR job |
+| `GEMINI_COST_LEDGER_DIR` | Directory for the global administrator ledger (default `backend/data/gemini_costs`) |
+| `ADMIN_API_KEY` | Optional; when set, `GET /api/admin/gemini-costs*` requires header `X-Admin-Key` |
 | `VITE_API_PROXY_TARGET` | Vite proxy target (Compose: `http://backend:8000`) |
 | `VITE_PROXY_TIMEOUT_MS` | Dev proxy socket timeout for `/api` and `/health` (default `900000` ms = 15 min; raise for large PDFs / slow models) |
 
@@ -168,6 +172,110 @@ text = transcribe_image(
 )
 ```
 
+## Logging and Gemini cost accounting
+
+### Application logs
+
+The backend configures Python logging at startup from `LOG_LEVEL` (default `INFO`):
+
+```text
+%(asctime)s %(levelname)s %(name)s: %(message)s
+```
+
+- **`INFO`**: job lifecycle, provider choice, Gemini key slot, per-page success/failure summaries, cost log writes.
+- **`DEBUG`**: extra provider dispatch detail (enable when diagnosing retries or concurrency).
+
+With Docker Compose, follow backend output:
+
+```bash
+docker compose logs -f backend
+```
+
+Filter Gemini-related lines:
+
+```bash
+docker compose logs backend | grep -E 'gemini|Gemini|cost|API key slot'
+```
+
+### Per-job artifacts on disk
+
+Each `POST /api/ocr` batch is stored under `UPLOAD_STORAGE_DIR/<job-uuid>/` (default `backend/data/uploads/<uuid>/`):
+
+| File | Purpose |
+|------|---------|
+| `metadata.json` | Provider, model, upload filenames, timestamps |
+| `results.jsonl` | One JSON line per completed page (appended as pages finish) |
+| `job_complete.json` | Written when the job finishes (success or partial) |
+| `gemini_cost_log.json` | Gemini jobs only — token usage and USD estimates (see below) |
+
+`UPLOAD_RETAIN=false` (default) deletes the batch folder after a **successful** run; set `UPLOAD_RETAIN=true` or `UPLOAD_RETAIN_HOURS>0` to keep folders for inspection.
+
+### How Gemini token usage is recorded
+
+Cost tracking applies **only to the `gemini` provider** when `GEMINI_COST_LOG_ENABLED=true`.
+
+For **each successfully transcribed page**, the app makes one `generateContent` call and reads Google's `usage_metadata` from the response:
+
+- **`input_tokens`** ← `prompt_token_count` (system prompt + user text + page image tokens + few-shots)
+- **`output_tokens`** ← `candidates_token_count` (transcribed text)
+- **`cached_tokens`** ← `cached_content_token_count` (logged when present; not subtracted from cost estimates)
+
+The app does **not** estimate tokens locally. There is no separate Vision API or Document AI billing — everything is one Gemini multimodal call per page. Failed calls and retries are not logged until a call succeeds.
+
+USD estimates use the Standard paid-tier rates in `backend/app/cost/gemini_pricing.py` ([Google pricing](https://ai.google.dev/gemini-api/docs/pricing)). Free-tier or actual invoice amounts may differ.
+
+### Cost log files
+
+**Per job** — `backend/data/uploads/<job-id>/gemini_cost_log.json`:
+
+```json
+{
+  "session_info": { "job_id", "model", "start_time", "end_time", ... },
+  "summary": {
+    "total_api_calls", "total_input_tokens", "total_output_tokens",
+    "input_cost_usd", "output_cost_usd", "estimated_total_cost_usd", ...
+  },
+  "api_calls": [
+    { "page_index", "source_file", "input_tokens", "output_tokens", "estimated_cost_usd", ... }
+  ]
+}
+```
+
+**Global ledger** — `backend/data/gemini_costs/ledger.jsonl` (append-only JSONL):
+
+- One `job_summary` line per completed Gemini job
+- One `api_call` line per successful page
+
+### Cost API (UI + admin)
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/gemini-costs/summary` | Aggregate Gemini token usage and USD estimates across all saved jobs (used by the Studio UI) |
+| `GET /api/ocr/{job_id}/result` | Includes optional `gemini_cost` when a `gemini_cost_log.json` exists for that job |
+| `GET /api/admin/gemini-costs` | Recent job cost summaries from the global ledger |
+| `GET /api/admin/gemini-costs/{job_id}` | Ledger lines + on-disk `gemini_cost_log.json` for one job |
+
+If `ADMIN_API_KEY` is set in `.env`, pass `X-Admin-Key: <value>` on the `/api/admin/*` routes.
+
+### Quick cost rollup (all jobs on disk)
+
+From the repo root, sum every saved `gemini_cost_log.json`:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+root = Path("backend/data/uploads")
+total = calls = pages = 0
+for p in root.glob("*/gemini_cost_log.json"):
+    d = json.loads(p.read_text())
+    total += d["summary"]["estimated_total_cost_usd"]
+    calls += d["summary"]["total_api_calls"]
+    pages += d["summary"]["total_api_calls"]
+print(f"jobs={len(list(root.glob('*/gemini_cost_log.json')))} pages={pages} calls={calls} usd={total:.4f}")
+PY
+```
+
 ## Vedic OCR tuning tips
 
 - **DPI**: PDFs render at **200 DPI** by default (`app/utils/pdf.py`); raise DPI for very small type (watch token/image size limits).
@@ -186,6 +294,9 @@ pytest -q
 ## Project layout
 
 - `backend/app` — FastAPI app, providers, PDF utils
+- `backend/app/cost` — Gemini pricing table and cost ledger (`gemini_ledger.py`, `gemini_pricing.py`)
+- `backend/data/uploads` — per-job OCR batches and `gemini_cost_log.json` (gitignored)
+- `backend/data/gemini_costs` — global `ledger.jsonl` (gitignored)
 - `backend/tests` — smoke tests
 - `frontend` — Vite React UI
 - `docker-compose.yml` — optional local stack

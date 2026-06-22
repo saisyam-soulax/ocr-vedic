@@ -58,6 +58,10 @@ import re as _re
 
 from app.schemas import (
     ErrorResponse,
+    GeminiCostsOverviewResponse,
+    GeminiJobCostEntry,
+    GeminiJobCostSummary,
+    GeminiModelCostBreakdown,
     HealthResponse,
     OcrDefaultsResponse,
     OcrJobResponse,
@@ -78,7 +82,7 @@ from app.services.ocr_service import (
 from app.utils.model_id import resolve_model_id_for_provider
 from app.utils.output_format import format_consolidated_ocr_text, page_sort_key
 from app.storage_uploads import persist_ocr_uploads, prune_old_batches, write_batch_metadata
-from app.cost.gemini_ledger import read_global_ledger
+from app.cost.gemini_ledger import aggregate_gemini_costs, read_global_ledger, read_job_cost_summary
 
 # ---------------------------------------------------------------------------
 # In-memory job registry  { job_id -> (queue, background_task, created_at) }
@@ -103,13 +107,17 @@ def _prune_stale_jobs() -> None:
 
 def _provider_configured(settings: Settings, p: OcrProvider) -> tuple[bool, str | None]:
     if p == OcrProvider.gemini:
+        api_key, _ = settings.effective_google_api_key()
         if settings.gemini_use_vertexai:
-            ok = bool(settings.google_api_key) or bool(settings.google_cloud_project)
+            ok = bool(api_key) or bool(settings.google_cloud_project)
             return ok, None if ok else (
-                "Vertex AI mode requires GOOGLE_API_KEY or GOOGLE_CLOUD_PROJECT + ADC"
+                "Vertex AI mode requires a Gemini API key "
+                "(GOOGLE_API_KEY-Sampath / GOOGLE_API_KEY) or GOOGLE_CLOUD_PROJECT + ADC"
             )
-        ok = bool(settings.google_api_key)
-        return ok, None if ok else "Set GOOGLE_API_KEY"
+        ok = bool(api_key)
+        return ok, None if ok else (
+            "Set GOOGLE_API_KEY-Sampath (or GOOGLE_API_KEY)"
+        )
     if p == OcrProvider.bedrock_claude:
         ok = bool(settings.aws_region and settings.bedrock_claude_model_id)
         return ok, None if ok else "Set AWS_REGION and BEDROCK_CLAUDE_MODEL_ID"
@@ -505,6 +513,11 @@ def create_app() -> FastAPI:
         else:
             combined_text = ""
 
+        gemini_cost = None
+        cost_raw = read_job_cost_summary(batch_dir)
+        if cost_raw:
+            gemini_cost = GeminiJobCostSummary(**cost_raw)
+
         return OcrSavedResult(
             job_id=job_id,
             done=done,
@@ -517,6 +530,7 @@ def create_app() -> FastAPI:
             elapsed_seconds=elapsed,
             pages=pages,
             combined_text=combined_text,
+            gemini_cost=gemini_cost,
         )
 
     @app.get("/api/ocr/jobs", response_model=dict)
@@ -545,10 +559,30 @@ def create_app() -> FastAPI:
                         total=saved.total,
                         done_count=saved.done_count,
                         completed_at=saved.completed_at,
+                        gemini_cost=saved.gemini_cost,
                     ))
                 except Exception:
                     pass
         return {"jobs": [j.model_dump() for j in jobs]}
+
+    @app.get("/api/gemini-costs/summary", response_model=GeminiCostsOverviewResponse)
+    async def gemini_costs_summary(s: Settings = Depends(get_settings)) -> GeminiCostsOverviewResponse:
+        """Aggregate Gemini token usage and USD estimates across all saved OCR jobs."""
+        raw = aggregate_gemini_costs(s.upload_root_path())
+        return GeminiCostsOverviewResponse(
+            job_count=raw["job_count"],
+            total_pages=raw["total_pages"],
+            total_api_calls=raw["total_api_calls"],
+            total_input_tokens=raw["total_input_tokens"],
+            total_output_tokens=raw["total_output_tokens"],
+            input_cost_usd=raw["input_cost_usd"],
+            output_cost_usd=raw["output_cost_usd"],
+            estimated_total_cost_usd=raw["estimated_total_cost_usd"],
+            pricing_source=raw["pricing_source"],
+            pricing_effective=raw["pricing_effective"],
+            by_model=[GeminiModelCostBreakdown(**m) for m in raw["by_model"]],
+            jobs=[GeminiJobCostEntry(**j) for j in raw["jobs"]],
+        )
 
     @app.get("/api/ocr/{job_id}/result", response_model=OcrSavedResult)
     async def get_ocr_result(job_id: str, s: Settings = Depends(get_settings)) -> OcrSavedResult:

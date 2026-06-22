@@ -51,6 +51,33 @@ type SavedJob = {
   isComplete: boolean // true when the SSE 'done' event fired
 }
 
+type GeminiJobCost = {
+  model?: string | null
+  total_api_calls?: number
+  total_input_tokens?: number
+  total_output_tokens?: number
+  input_cost_usd?: number
+  output_cost_usd?: number
+  estimated_total_cost_usd?: number
+  pricing_model_key?: string | null
+  pricing_source?: string | null
+  pricing_effective?: string | null
+}
+
+type GeminiCostsOverview = {
+  job_count: number
+  total_pages: number
+  total_api_calls: number
+  total_input_tokens: number
+  total_output_tokens: number
+  input_cost_usd: number
+  output_cost_usd: number
+  estimated_total_cost_usd: number
+  pricing_source: string | null
+  pricing_effective: string | null
+  jobs: Array<GeminiJobCost & { job_id: string; submitted_at?: string | null; files?: string[] }>
+}
+
 // ─── localStorage helpers ─────────────────────────────────────────────────────
 
 const SAVED_JOBS_KEY = 'vedic-ocr:saved-jobs'
@@ -90,6 +117,21 @@ function removeSavedJobById(job_id: string): SavedJob[] {
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 const ACCEPT_EXT = '.pdf,application/pdf,image/*'
+
+function formatUsd(amount: number | undefined | null): string {
+  const n = amount ?? 0
+  if (!Number.isFinite(n) || n <= 0) return '$0.00'
+  if (n < 0.01) return `$${n.toFixed(4)}`
+  if (n < 1) return `$${n.toFixed(3)}`
+  return `$${n.toFixed(2)}`
+}
+
+function formatTokenCount(n: number | undefined | null): string {
+  const v = n ?? 0
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(2)}M`
+  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}k`
+  return v.toLocaleString()
+}
 
 function friendlyModelLabel(id: string): string {
   const lookup: Array<[RegExp, string]> = [
@@ -232,7 +274,6 @@ async function downloadDocxBlob(filename: string, text: string) {
 
 export default function App() {
   const mainInputId = useId()
-  const modelOptionsDatalistId = useId()
   const modelInputId = useId()
   const providerSelectId = useId()
   const userPromptId = useId()
@@ -274,6 +315,10 @@ export default function App() {
   const [error, setError] = useState<string | null>(null)
   const [copyDone, setCopyDone] = useState(false)
   const [savedJobs, setSavedJobs] = useState<SavedJob[]>(() => loadSavedJobs())
+  const [geminiCostsOverview, setGeminiCostsOverview] = useState<GeminiCostsOverview | null>(
+    null,
+  )
+  const [sessionGeminiCost, setSessionGeminiCost] = useState<GeminiJobCost | null>(null)
 
   // ── vLLM ───────────────────────────────────────────────────────────────────
   const [vllmStatus, setVllmStatus] = useState<VllmStatus | null>(null)
@@ -289,6 +334,29 @@ export default function App() {
   useEffect(() => {
     providerRef.current = provider
   }, [provider])
+
+  const refreshGeminiCosts = useCallback(() => {
+    fetch(apiUrl('gemini-costs/summary'))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((body: GeminiCostsOverview | null) => {
+        if (body) setGeminiCostsOverview(body)
+      })
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    refreshGeminiCosts()
+  }, [refreshGeminiCosts])
+
+  const jobCostById = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const j of geminiCostsOverview?.jobs ?? []) {
+      if (j.job_id && j.estimated_total_cost_usd != null) {
+        m.set(j.job_id, j.estimated_total_cost_usd)
+      }
+    }
+    return m
+  }, [geminiCostsOverview])
 
   // ── On mount: pull server-side incomplete jobs and merge into savedJobs ──────
   // This surfaces runs that broke mid-way before the checkpoint code existed —
@@ -510,6 +578,7 @@ export default function App() {
       elapsed_seconds?: number | null
       combined_text?: string
       done?: boolean
+      gemini_cost?: GeminiJobCost | null
     }>
   }, [])
 
@@ -520,6 +589,7 @@ export default function App() {
       provider?: string | null
       elapsed_seconds?: number | null
       combined_text?: string
+      gemini_cost?: GeminiJobCost | null
     }) => {
       const sorted = [...(body.pages ?? [])].sort(pageSortKey)
       if (sorted.length) setPages(sorted)
@@ -527,6 +597,8 @@ export default function App() {
       if (body.combined_text?.trim()) setServerCombinedText(body.combined_text)
       if (body.provider) setProvider(body.provider)
       if (body.elapsed_seconds != null) setElapsedSecs(body.elapsed_seconds)
+      if (body.gemini_cost) setSessionGeminiCost(body.gemini_cost)
+      else if (body.provider && body.provider !== 'gemini') setSessionGeminiCost(null)
       if (sorted.length) {
         setPagesTotal(sorted.length)
         setPagesDone(sorted.length)
@@ -561,6 +633,7 @@ export default function App() {
     setPagesTotal(0)
     setStreamDone(false)
     setElapsedSecs(null)
+    setSessionGeminiCost(null)
     setPreparing(true)
     setCopyDone(false)
     setResultSourceFiles(mainFiles.map((f) => f.name))
@@ -714,22 +787,29 @@ export default function App() {
       isDone = true
       let finalTotal = 0
       try {
-        const d = JSON.parse(e.data) as { total: number; elapsed_seconds: number }
+        const d = JSON.parse(e.data) as {
+          total: number
+          elapsed_seconds: number
+          gemini_cost?: GeminiJobCost | null
+        }
         setElapsedSecs(d.elapsed_seconds)
         setPagesDone(d.total)
         setPagesTotal(d.total)
         finalTotal = d.total
+        if (d.gemini_cost) setSessionGeminiCost(d.gemini_cost)
       } catch { /* ignore */ }
       es.close()
       esRef.current = null
       setStreamDone(true)
       setLoading(false)
+      refreshGeminiCosts()
 
       // Prefer server-built file (includes PAGE markers) once job is done
       fetch(apiUrl(`ocr/${jobId}/result`))
         .then((r) => (r.ok ? r.json() : null))
-        .then((body: { combined_text?: string } | null) => {
+        .then((body: { combined_text?: string; gemini_cost?: GeminiJobCost | null } | null) => {
           if (body?.combined_text?.trim()) setServerCombinedText(body.combined_text)
+          if (body?.gemini_cost) setSessionGeminiCost(body.gemini_cost)
         })
         .catch(() => {})
 
@@ -852,6 +932,7 @@ export default function App() {
         provider?: string | null
         elapsed_seconds?: number | null
         combined_text?: string
+        gemini_cost?: GeminiJobCost | null
       }
       const sorted = [...(body.pages ?? [])].sort(pageSortKey)
       setPages(sorted)
@@ -859,6 +940,8 @@ export default function App() {
       setServerCombinedText(body.combined_text?.trim() ? body.combined_text : null)
       if (body.provider) setProvider(body.provider)
       if (body.elapsed_seconds != null) setElapsedSecs(body.elapsed_seconds)
+      if (body.gemini_cost) setSessionGeminiCost(body.gemini_cost)
+      else if (body.provider && body.provider !== 'gemini') setSessionGeminiCost(null)
       setPagesTotal(sorted.length)
       setPagesDone(sorted.length)
       setStreamDone(true)
@@ -897,6 +980,28 @@ export default function App() {
             Local · API
           </span>
         </div>
+        {geminiCostsOverview && geminiCostsOverview.job_count > 0 ? (
+          <div
+            className="cost-banner"
+            title={
+              geminiCostsOverview.pricing_effective
+                ? `Estimated using ${geminiCostsOverview.pricing_effective}. Actual billing may differ (e.g. free tier).`
+                : 'Estimated Gemini API cost from saved job logs'
+            }
+          >
+            <span className="cost-banner__label">Gemini total (est.)</span>
+            <strong className="cost-banner__amount">
+              {formatUsd(geminiCostsOverview.estimated_total_cost_usd)}
+            </strong>
+            <span className="cost-banner__meta">
+              {geminiCostsOverview.total_pages.toLocaleString()} pages ·{' '}
+              {geminiCostsOverview.job_count} job
+              {geminiCostsOverview.job_count !== 1 ? 's' : ''} ·{' '}
+              {formatTokenCount(geminiCostsOverview.total_input_tokens)} in /{' '}
+              {formatTokenCount(geminiCostsOverview.total_output_tokens)} out tokens
+            </span>
+          </div>
+        ) : null}
         <ol className="app-workflow" aria-label="Workflow">
           <li>
             <strong>1.</strong> Sources &amp; model
@@ -969,28 +1074,37 @@ export default function App() {
               <label className="field-label" htmlFor={modelInputId} style={{ marginTop: 14 }}>
                 Model
               </label>
-              <input
-                id={modelInputId}
-                type="text"
-                list={modelOptionsDatalistId}
-                value={modelIdValue}
-                onChange={(e) => setModelIdValue(e.target.value)}
-                placeholder={activeProvider?.default_model_id ?? 'Server default when left blank'}
-                autoComplete="off"
-                spellCheck={false}
-                aria-describedby="model-hint"
-              />
-              <datalist id={modelOptionsDatalistId}>
-                {(activeProvider?.model_options ?? []).map((opt) => (
-                  <option key={opt} value={opt} label={friendlyModelLabel(opt)}>
-                    {friendlyModelLabel(opt)}
-                  </option>
-                ))}
-              </datalist>
+              {(activeProvider?.model_options ?? []).length > 0 ? (
+                /* Known options → proper <select> so the list is always visible */
+                <select
+                  id={modelInputId}
+                  value={modelIdValue}
+                  onChange={(e) => setModelIdValue(e.target.value)}
+                  aria-describedby="model-hint"
+                >
+                  {(activeProvider?.model_options ?? []).map((opt) => (
+                    <option key={opt} value={opt}>
+                      {friendlyModelLabel(opt)}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                /* No known options (provider not yet loaded) → free-text fallback */
+                <input
+                  id={modelInputId}
+                  type="text"
+                  value={modelIdValue}
+                  onChange={(e) => setModelIdValue(e.target.value)}
+                  placeholder={activeProvider?.default_model_id ?? 'Server default when left blank'}
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-describedby="model-hint"
+                />
+              )}
               <p id="model-hint" className="field-note">
                 {provider === 'vllm_dots'
                   ? 'Use the served name (usually "model"). Gemini/Bedrock IDs are ignored for local OCR.'
-                  : 'Pick a suggestion or type any model ID your backend supports. Empty uses the server default.'}
+                  : 'Select a model or leave as-is to use the server default.'}
               </p>
 
               {/* vLLM status panel — only shown when using the local model */}
@@ -1410,6 +1524,22 @@ export default function App() {
                   </>
                 )}
                 {elapsedSecs !== null && <> · {elapsedSecs.toFixed(1)} s</>}
+                {sessionGeminiCost && provider === 'gemini' && (
+                  <>
+                    {' '}
+                    · est.{' '}
+                    <strong title="Gemini API cost estimate for this session">
+                      {formatUsd(sessionGeminiCost.estimated_total_cost_usd)}
+                    </strong>
+                    {sessionGeminiCost.total_input_tokens != null && (
+                      <span className="result-meta__tokens">
+                        {' '}
+                        ({formatTokenCount(sessionGeminiCost.total_input_tokens)} in /{' '}
+                        {formatTokenCount(sessionGeminiCost.total_output_tokens)} out)
+                      </span>
+                    )}
+                  </>
+                )}
               </p>
             </div>
             <div className="output" tabIndex={0}>
@@ -1444,6 +1574,9 @@ export default function App() {
                           ? `${job.pages}/${job.totalPages}p — incomplete`
                           : `${job.pages}p saved — incomplete`}{' '}
                       · {job.provider}
+                      {job.provider === 'gemini' && jobCostById.has(job.job_id) && (
+                        <> · est. {formatUsd(jobCostById.get(job.job_id))}</>
+                      )}
                     </span>
                   </div>
                   <div className="toolbar">
